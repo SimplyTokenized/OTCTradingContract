@@ -1,0 +1,42 @@
+{
+  "name": "otc-trading-contract",
+  "version": "1.0.0",
+  "description": "OTC Trading Contract - An upgradeable Over-The-Counter trading contract for ERC20 tokens",
+  "main": "index.js",
+  "scripts": {
+    "setup": "forge install OpenZeppelin/openzeppelin-contracts-upgradeable OpenZeppelin/openzeppelin-foundry-upgrades OpenZeppelin/openzeppelin-contracts --no-commit",
+    "build": "forge build",
+    "test": "forge test",
+    "test:gas": "forge test --gas-report --optimizer-runs 10000",
+    "test:verbose": "forge test -vv",
+    "format": "forge fmt",
+    "deploy:testnet": "forge script script/DeployOTC.s.sol:DeployOTC --private-key $DEPLOYER_KEY --broadcast --verify --rpc-url $TESTNET_RPC --etherscan-api-key $ETHERSCAN_API_KEY --sender $DEPLOYER",
+    "deploy:fuji": "forge script script/DeployOTC.s.sol:DeployOTC --private-key $DEPLOYER_KEY --broadcast --verify --rpc-url $AVALANCHE_FUJI_RPC --etherscan-api-key $ETHERSCAN_API_KEY --verifier-url $AVALANCHE_FUJI_VERIFIER_URL --sender $DEPLOYER",
+    "deploy:sepolia": "forge script script/DeployOTC.s.sol:DeployOTC --private-key $DEPLOYER_KEY --broadcast --verify --rpc-url $ETH_SEPOLIA_RPC --etherscan-api-key $ETHERSCAN_API_KEY --sender $DEPLOYER",
+    "deploy:local": "forge script script/DeployOTC.s.sol:DeployOTC --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --broadcast --rpc-url http://localhost:8545 --sender 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "anvil": "anvil",
+    "anvil:fork": "anvil --fork-url $MAINNET_RPC",
+    "slither": "slither .",
+    "clean": "forge clean",
+    "install:deps": "forge install OpenZeppelin/openzeppelin-contracts-upgradeable OpenZeppelin/openzeppelin-foundry-upgrades OpenZeppelin/openzeppelin-contracts",
+    "update:deps": "forge update",
+    "docgen": "forge doc --build --out docs",
+    "docgen:serve": "forge doc --build --serve --open --out docs"
+  },
+  "keywords": [
+    "solidity",
+    "otc",
+    "trading",
+    "erc20",
+    "blockchain",
+    "ethereum",
+    "avalanche",
+    "foundry",
+    "defi"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}
