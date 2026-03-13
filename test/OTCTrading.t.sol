@@ -38,12 +38,28 @@ contract OTCTradingTest is Test {
         usdc = new MockERC20("USD Coin", "USDC");
 
         // Deploy OTC contract with proxy
+        // Initialize with same defaults as original implementation:
+        // makerFeeBps = 25 (0.25%), takerFeeBps = 50 (0.5%),
+        // minOrderSize = 100, maxOrderSize = 0 (no max),
+        // defaultOrderExpiration = 0 (no expiration),
+        // requireWhitelist = true.
         address proxyAddress = Upgrades.deployTransparentProxy(
             "OTCTrading.sol",
             admin,
             abi.encodeCall(
                 OTCTrading.initialize,
-                (address(baseToken), address(usdc), feeRecipient, admin)
+                (
+                    address(baseToken),
+                    address(usdc),
+                    feeRecipient,
+                    admin,
+                    25,
+                    50,
+                    100,
+                    0,
+                    0,
+                    true
+                )
             )
         );
 

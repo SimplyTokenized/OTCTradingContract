@@ -108,12 +108,24 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
      * @param _defaultCounterpartyToken Default counterparty token (e.g., USDC)
      * @param _feeRecipient Address that receives trading fees
      * @param _admin Admin address
+     * @param _makerFeeBps Initial maker fee in basis points (max 1000 = 10%)
+     * @param _takerFeeBps Initial taker fee in basis points (max 1000 = 10%)
+     * @param _minOrderSize Initial minimum order size (must be > 0 and <= _maxOrderSize if max is set)
+     * @param _maxOrderSize Initial maximum order size (0 = no limit, must be >= _minOrderSize if set)
+     * @param _defaultOrderExpiration Default order expiration time in seconds (0 = no expiration)
+     * @param _requireWhitelist Whether whitelist is required for trading
      */
     function initialize(
         address _baseToken,
         address _defaultCounterpartyToken,
         address _feeRecipient,
-        address _admin
+        address _admin,
+        uint256 _makerFeeBps,
+        uint256 _takerFeeBps,
+        uint256 _minOrderSize,
+        uint256 _maxOrderSize,
+        uint256 _defaultOrderExpiration,
+        bool _requireWhitelist
     ) public initializer {
         __AccessControl_init();
         __ReentrancyGuard_init();
@@ -124,16 +136,22 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
         require(_feeRecipient != address(0), "OTCTrading: invalid fee recipient");
         require(_admin != address(0), "OTCTrading: invalid admin");
 
+        // Validate economic parameters (mirror admin setters)
+        require(_makerFeeBps <= 1000, "OTCTrading: maker fee too high"); // Max 10%
+        require(_takerFeeBps <= 1000, "OTCTrading: taker fee too high"); // Max 10%
+        require(_minOrderSize > 0, "OTCTrading: invalid min order size");
+        require(_maxOrderSize == 0 || _maxOrderSize >= _minOrderSize, "OTCTrading: max below min");
+
         baseToken = _baseToken;
         feeRecipient = _feeRecipient;
 
-        // Set default fees: 0.25% maker, 0.5% taker
-        makerFeeBps = 25; // 0.25%
-        takerFeeBps = 50; // 0.5%
-        minOrderSize = 100; // Minimum order size
-        maxOrderSize = 0; // No maximum by default
-        requireWhitelist = true; // Whitelist required by default
-        defaultOrderExpiration = 0; // No expiration by default
+        // Set initial fees and trading parameters
+        makerFeeBps = _makerFeeBps;
+        takerFeeBps = _takerFeeBps;
+        minOrderSize = _minOrderSize;
+        maxOrderSize = _maxOrderSize;
+        requireWhitelist = _requireWhitelist;
+        defaultOrderExpiration = _defaultOrderExpiration;
 
         // Add default counterparty token
         allowedCounterpartyTokens[_defaultCounterpartyToken] = true;

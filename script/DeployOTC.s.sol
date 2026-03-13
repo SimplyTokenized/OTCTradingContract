@@ -26,12 +26,30 @@ contract DeployOTC is Script {
         console.log("Admin:", admin);
 
         // Deploy transparent proxy
+        // NOTE: These initial economic parameters should be wired from your UI/config
+        // if you want them to be dynamic. For now we use the same defaults
+        // as the original implementation:
+        // makerFeeBps = 25 (0.25%), takerFeeBps = 50 (0.5%),
+        // minOrderSize = 100, maxOrderSize = 0 (no max),
+        // defaultOrderExpiration = 0 (no expiration),
+        // requireWhitelist = true.
         address proxyAddress = Upgrades.deployTransparentProxy(
             "OTCTrading.sol",
             admin, // Proxy admin
             abi.encodeCall(
                 OTCTrading.initialize,
-                (baseToken, defaultCounterpartyToken, feeRecipient, admin)
+                (
+                    baseToken,
+                    defaultCounterpartyToken,
+                    feeRecipient,
+                    admin,
+                    25,
+                    50,
+                    100,
+                    0,
+                    0,
+                    true
+                )
             )
         );
 
