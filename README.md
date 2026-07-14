@@ -35,7 +35,7 @@ An upgradeable on-chain **Over-The-Counter (OTC)** trading contract for ERC-20 t
 - **Partial fills** — orders can be filled incrementally.
 - **Pausable** — admin can halt trading.
 - **Role-based access control** — separate admin and fee-recipient roles.
-- **Reentrancy-protected** — all state-changing external functions use `nonReentrant`, and settlement uses `SafeERC20`.
+- **Reentrancy-protected** — all state-changing external functions use `nonReentrant` via OpenZeppelin's [`ReentrancyGuardTransient`](https://docs.openzeppelin.com/contracts/5.x/api/utils#ReentrancyGuardTransient) (EIP-1153 transient storage, zero persistent storage), and settlement uses `SafeERC20`.
 
 > ⚠️ **Fee-on-transfer / rebasing tokens are not supported.** The accounting assumes the contract receives exactly the amount transferred. Do not approve such tokens as base or counterparty tokens.
 
@@ -52,6 +52,8 @@ The system is deployed behind an OpenZeppelin **transparent proxy**:
 Upgrades are authorized by the **ProxyAdmin owner** — this is independent from the contract's internal `AccessControl` roles. See [Roles & Trust Model](#-roles--trust-model).
 
 Solidity `0.8.27`, built with [Foundry](https://book.getfoundry.sh/), `via-IR` enabled, OpenZeppelin Contracts v5.
+
+> **⚠️ Chain requirement:** Reentrancy protection uses `ReentrancyGuardTransient`, which relies on **EIP-1153 transient storage**. The contract must be deployed on a **Cancun-capable chain** (`evm_version = "cancun"`). All target networks — Ethereum mainnet/Sepolia, Avalanche C-Chain/Fuji, and major L2s — support this. Deploying to a pre-Cancun EVM will cause `nonReentrant` calls to fail.
 
 ## 📋 Trading Parameters
 
@@ -215,7 +217,7 @@ Run `Upgrades.validateUpgrade` (or `forge` with the OpenZeppelin upgrades plugin
 
 ## 🛡️ Security
 
-- All trading entry points are `nonReentrant`; token transfers use `SafeERC20`; ETH transfers use checked low-level calls.
+- All trading entry points are `nonReentrant` (OpenZeppelin `ReentrancyGuardTransient`, EIP-1153 — requires a Cancun-capable chain); token transfers use `SafeERC20`; ETH transfers use checked low-level calls.
 - Fee rates are snapshotted per order and cannot be changed retroactively.
 - Fills that round the counterparty amount to zero are rejected.
 - `emergencyWithdraw` is gated behind `whenPaused`, so any withdrawal is preceded by a visible on-chain pause.

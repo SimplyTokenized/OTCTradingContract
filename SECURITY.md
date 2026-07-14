@@ -58,3 +58,7 @@ custody arrangement should be published so users can assess counterparty risk.
   counterparty tokens; the accounting assumes exact-amount transfers.
 - Order-enumeration views (`getActiveOrders`, `getOrdersByToken`) iterate over all orders and are
   intended for off-chain (`eth_call`) use, not on-chain composition.
+- Reentrancy protection uses OpenZeppelin `ReentrancyGuardTransient` (EIP-1153 transient storage).
+  The contract **must** be deployed on a Cancun-capable chain; on a pre-Cancun EVM, `nonReentrant`
+  calls will revert. This guard holds **zero persistent storage**, so it cannot shift or collide with
+  the contract's storage layout across upgrades.

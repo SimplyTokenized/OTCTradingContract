@@ -2,7 +2,7 @@
 pragma solidity 0.8.27;
 
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import {ReentrancyGuardUpgradeable} from "./ReentrancyGuardUpgradeable.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -17,7 +17,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  * will cause accounting issues because the contract receives less tokens than expected.
  * Only standard ERC20 tokens should be used as counterparty tokens.
  */
-contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
+contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardTransient, PausableUpgradeable {
     using SafeERC20 for IERC20;
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
@@ -132,7 +132,6 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
         bool _requireWhitelist
     ) public initializer {
         __AccessControl_init();
-        __ReentrancyGuard_init();
         __Pausable_init();
 
         require(_baseToken != address(0), "OTCTrading: invalid base token");
