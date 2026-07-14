@@ -25,7 +25,8 @@ contract DeployOTC is Script {
         console.log("Fee Recipient:", feeRecipient);
         console.log("Admin:", admin);
 
-        // Deploy transparent proxy
+        // Deploy UUPS proxy. Upgrades are authorized by UPGRADER_ROLE on the implementation
+        // (granted to `admin` at init) — move that role to a Timelock + multisig for production.
         // NOTE: These initial economic parameters should be wired from your UI/config
         // if you want them to be dynamic. For now we use the same defaults
         // as the original implementation:
@@ -33,22 +34,24 @@ contract DeployOTC is Script {
         // minOrderSize = 100, maxOrderSize = 0 (no max),
         // defaultOrderExpiration = 0 (no expiration),
         // requireWhitelist = true.
-        address proxyAddress = Upgrades.deployTransparentProxy(
+        address proxyAddress = Upgrades.deployUUPSProxy(
             "OTCTrading.sol",
-            admin, // Proxy admin
             abi.encodeCall(
                 OTCTrading.initialize,
                 (baseToken, defaultCounterpartyToken, feeRecipient, admin, 25, 50, 100, 0, 0, true)
             )
         );
 
-        otc = OTCTrading(payable(proxyAddress));
+        otc = OTCTrading(proxyAddress);
 
         console.log("===========================================");
         console.log("Proxy address (USE THIS):", proxyAddress);
         console.log("===========================================");
         address implementationAddress = Upgrades.getImplementationAddress(proxyAddress);
         console.log("Implementation address (reference only):", implementationAddress);
+
+        // To enable native-ETH-denominated orders, the admin allow-lists address(0):
+        //   otc.addCounterpartyToken(address(0));
 
         vm.stopBroadcast();
     }

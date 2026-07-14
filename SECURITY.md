@@ -42,20 +42,32 @@ Please give us a reasonable opportunity to remediate before any public disclosur
 
 ## Trust model & privileged roles
 
-Users interacting with a deployment should understand the following trust assumptions:
+The contract is **non-custodial**: orders are backed by allowances, so it holds no ERC-20 funds at
+rest. The only funds it holds are native-ETH escrow for BUY-in-ETH orders and unclaimed ETH
+withdrawals, both exactly accounted. Users should still understand the following trust assumptions:
 
-- **ProxyAdmin owner** can upgrade the implementation, replacing all contract logic.
-- **`ADMIN_ROLE`** can change fees and limits, manage the whitelist and counterparty tokens,
-  pause the contract, and — **while paused** — call `emergencyWithdraw` to move any token or ETH
-  out of the contract, including funds backing open orders.
+- **`UPGRADER_ROLE`** can upgrade the UUPS implementation, replacing all contract logic. Because
+  makers grant standing allowances (and BUY+ETH makers escrow ETH), a malicious upgrade could reach
+  those balances. This role **must** be held by a Timelock + multisig so upgrades are time-delayed
+  and publicly visible, giving users a window to revoke approvals and exit.
+- **`ADMIN_ROLE`** can change fees and limits, manage the whitelist and counterparty tokens, pause
+  the contract, and **force-cancel** any order (`adminCancelOrder`). A force-cancel only deactivates
+  the order and returns any ETH escrow to the **maker** — the admin cannot take funds.
+
+There is **no `emergencyWithdraw`** and no admin path that can move a user's funds to the admin.
 
 For production deployments these roles should be held by a **multisig and/or timelock**, and the
-custody arrangement should be published so users can assess counterparty risk.
+trust arrangement should be published so users can assess counterparty risk.
 
 ## Known limitations
 
 - **Fee-on-transfer and rebasing tokens are not supported** and must not be configured as base or
   counterparty tokens; the accounting assumes exact-amount transfers.
+- **Allowance-backed orders are not guaranteed fillable:** a maker can move funds or revoke their
+  approval, so a fill may revert. This is a UX/liveness concern, not a fund-safety one; use
+  `isOrderFundable` to filter the book off-chain. (BUY+ETH orders are escrowed and always fillable.)
+- **ETH payouts to resting parties are pull-based** (`pendingWithdrawals` + `withdraw`). A maker or
+  fee recipient that cannot receive ETH accrues a claimable balance rather than blocking settlement.
 - Order-enumeration views (`getActiveOrders`, `getOrdersByToken`) iterate over all orders and are
   intended for off-chain (`eth_call`) use, not on-chain composition.
 - Reentrancy protection uses OpenZeppelin `ReentrancyGuardTransient` (EIP-1153 transient storage).

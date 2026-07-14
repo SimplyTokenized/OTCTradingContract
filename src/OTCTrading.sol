@@ -5,6 +5,7 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -16,12 +17,38 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  * Fee-on-transfer tokens (tokens that charge a fee on transfer like PAXG, some USDT implementations)
  * will cause accounting issues because the contract receives less tokens than expected.
  * Only standard ERC20 tokens should be used as counterparty tokens.
+ *
+ * @notice CUSTODY MODEL: orders are backed by an ALLOWANCE, not a deposit. Makers keep their funds
+ * in their own wallet and both legs settle atomically at fill time via `transferFrom`. There is one
+ * exception: a BUY order priced in native ETH must ESCROW `counterpartyAmount + makerFee` at
+ * creation, because an allowance can pull ERC20 at a later fill but nothing can pull native ETH from
+ * a maker who is not present in the taker's transaction. Escrow is tracked per order in
+ * {ethEscrowed} and the unfilled remainder is credited back to the maker on cancel/cleanup.
+ *
+ * @notice ETH PAYOUTS USE PULL PAYMENTS. Amounts owed to a resting party (a maker's ETH proceeds or
+ * escrow refund, and the fee recipient's fees) are booked into {pendingWithdrawals} and claimed
+ * later via {withdraw}; they are never pushed. This means a maker or fee recipient that cannot
+ * receive ETH can never block settlement, a cancel, or an admin/compliance force-cancel — they just
+ * accrue a claimable balance. Only the active caller (the taker) is paid inline. See
+ * NONCUSTODIAL_DESIGN.md. Invariant: `address(this).balance == Σ ethEscrowed + Σ pendingWithdrawals`.
+ *
+ * @notice UPGRADEABLE (UUPS). Because users grant this contract an allowance (and BUY+ETH makers
+ * escrow ETH in it), whoever holds UPGRADER_ROLE can in principle change the settlement code and
+ * move approved/escrowed balances. That role MUST be held by a Timelock + multisig so any upgrade is
+ * publicly visible for the delay window, letting users revoke approvals and exit before it lands.
+ * Storage is append-only across upgrades (enforced by the OpenZeppelin upgrades validator).
  */
-contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardTransient, PausableUpgradeable {
+contract OTCTrading is
+    Initializable,
+    AccessControlUpgradeable,
+    ReentrancyGuardTransient,
+    PausableUpgradeable,
+    UUPSUpgradeable
+{
     using SafeERC20 for IERC20;
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant FEE_RECIPIENT_ROLE = keccak256("FEE_RECIPIENT_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
     // Trading parameters
     uint256 public makerFeeBps; // Maker fee in basis points (1 bps = 0.01%)
@@ -70,6 +97,15 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
     uint256 public nextOrderId;
     mapping(address => uint256[]) public userOrders; // User's order IDs
 
+    // Native ETH escrowed for a BUY+ETH order (zero for every other order kind). There is no
+    // receive()/fallback, so a raw transfer to this contract reverts: the only ETH ever held backs
+    // either live escrow or an unclaimed withdrawal.
+    mapping(uint256 => uint256) public ethEscrowed;
+
+    // Claimable ETH booked for a party (maker proceeds/refunds, fee-recipient fees). Pull-payment:
+    // the owner calls {withdraw}. Appended after ethEscrowed to keep the storage layout append-only.
+    mapping(address => uint256) public pendingWithdrawals;
+
     // Events
     event OrderCreated(
         uint256 indexed orderId,
@@ -88,6 +124,10 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         uint256 takerFee
     );
     event OrderCancelled(uint256 indexed orderId, address indexed maker);
+    event OrderAdminCancelled(uint256 indexed orderId, address indexed maker, address indexed admin);
+    event EthEscrowRefunded(uint256 indexed orderId, address indexed maker, uint256 amount);
+    event EthCredited(address indexed account, uint256 amount);
+    event Withdrawn(address indexed account, uint256 amount);
     event CounterpartyTokenAdded(address indexed token);
     event CounterpartyTokenRemoved(address indexed token);
     event WhitelistAdded(address indexed account);
@@ -99,7 +139,6 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
     event MaxOrderSizeUpdated(uint256 maxOrderSize);
     event DefaultOrderExpirationUpdated(uint256 defaultOrderExpiration);
     event OrdersCleanedUp(uint256[] orderIds);
-    event EmergencyWithdrawal(address indexed token, address indexed to, uint256 amount);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -111,7 +150,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
      * @param _baseToken Address of the base ERC20 token to trade
      * @param _defaultCounterpartyToken Default counterparty token (e.g., USDC)
      * @param _feeRecipient Address that receives trading fees
-     * @param _admin Admin address
+     * @param _admin Admin address (also granted UPGRADER_ROLE; move it to a Timelock + multisig)
      * @param _makerFeeBps Initial maker fee in basis points (max 1000 = 10%)
      * @param _takerFeeBps Initial taker fee in basis points (max 1000 = 10%)
      * @param _minOrderSize Initial minimum order size (must be > 0 and <= _maxOrderSize if max is set)
@@ -136,6 +175,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
 
         require(_baseToken != address(0), "OTCTrading: invalid base token");
         require(_defaultCounterpartyToken != address(0), "OTCTrading: invalid counterparty token");
+        require(_defaultCounterpartyToken != _baseToken, "OTCTrading: counterparty is base token");
         require(_feeRecipient != address(0), "OTCTrading: invalid fee recipient");
         require(_admin != address(0), "OTCTrading: invalid admin");
 
@@ -163,10 +203,18 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         // Grant roles
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
         _grantRole(ADMIN_ROLE, _admin);
-        _grantRole(FEE_RECIPIENT_ROLE, _feeRecipient);
+        _grantRole(UPGRADER_ROLE, _admin);
 
         nextOrderId = 1;
     }
+
+    /**
+     * @dev Authorize a UUPS implementation upgrade. Restricted to UPGRADER_ROLE, which MUST be a
+     * Timelock + multisig so upgrades are time-delayed and publicly visible: users hold standing
+     * allowances (and BUY+ETH escrow) here and need a window to exit before a new implementation
+     * takes effect.
+     */
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {}
 
     // ============ Admin Functions ============
 
@@ -175,6 +223,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
      * @param token Address of the counterparty token (address(0) for ETH)
      */
     function addCounterpartyToken(address token) external onlyRole(ADMIN_ROLE) {
+        require(token != baseToken, "OTCTrading: counterparty is base token");
         require(!allowedCounterpartyTokens[token], "OTCTrading: token already allowed");
         allowedCounterpartyTokens[token] = true;
         emit CounterpartyTokenAdded(token);
@@ -314,6 +363,40 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         _unpause();
     }
 
+    /**
+     * @dev Admin/compliance force-cancel of an active order (e.g. a de-whitelisted or sanctioned
+     * maker whose resting orders must come off the book). The admin cannot take funds: an
+     * allowance-backed order simply goes inactive, and a BUY+ETH order's escrow is returned to its
+     * MAKER. Emitted with a distinct event so it is auditable and distinguishable from a
+     * maker-initiated cancel. Deliberate centralization power: hold ADMIN_ROLE behind a
+     * multisig/timelock.
+     * @param orderId ID of the order to force-cancel
+     */
+    function adminCancelOrder(uint256 orderId) external nonReentrant onlyRole(ADMIN_ROLE) {
+        Order storage order = orders[orderId];
+        require(order.isActive, "OTCTrading: order not active");
+        address maker = order.maker;
+        order.isActive = false;
+        emit OrderAdminCancelled(orderId, maker, msg.sender);
+        _refundEscrow(orderId, maker);
+    }
+
+    /**
+     * @dev Batch variant of {adminCancelOrder}. Skips orders that are already inactive.
+     * @param orderIds Array of order IDs to force-cancel
+     */
+    function adminCancelOrders(uint256[] calldata orderIds) external nonReentrant onlyRole(ADMIN_ROLE) {
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            Order storage order = orders[orderIds[i]];
+            if (order.isActive) {
+                address maker = order.maker;
+                order.isActive = false;
+                emit OrderAdminCancelled(orderIds[i], maker, msg.sender);
+                _refundEscrow(orderIds[i], maker);
+            }
+        }
+    }
+
     // ============ Trading Functions ============
 
     /**
@@ -324,14 +407,17 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
     }
 
     /**
-     * @dev Receive ETH
-     */
-    receive() external payable {
-        // Allow contract to receive ETH
-    }
-
-    /**
      * @dev Create a new order (buy or sell)
+     *
+     * Funding is by ALLOWANCE, not deposit — approve this contract for your side of the trade and
+     * keep custody until a taker fills. The one exception is a BUY order priced in ETH, which must
+     * send `counterpartyTokenAmount + makerFee` as msg.value to be escrowed (native ETH cannot be
+     * pulled from an absent maker at fill time).
+     *
+     * For allowance-backed orders the balance/allowance check below is a soft precheck only:
+     * fillability is NOT guaranteed later, since the maker may move funds or revoke the allowance.
+     * Use {isOrderFundable} to filter the book off-chain. An escrowed BUY+ETH order is always fillable.
+     *
      * @param orderType Type of order: BUY (buying base tokens) or SELL (selling base tokens)
      * @param counterpartyToken Address of the counterparty token (address(0) for ETH, or ERC20 token)
      * @param baseTokenAmount Amount of base token to buy/sell
@@ -360,24 +446,21 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         require(counterpartyTokenAmount * 1e18 / baseTokenAmount >= 1, "OTCTrading: price too low");
         require(counterpartyTokenAmount * 1e18 / baseTokenAmount <= 1e36, "OTCTrading: price too high");
 
-        // Handle token transfers based on order type
-        if (orderType == OrderType.SELL) {
-            // SELL order: maker deposits base tokens
-            IERC20(baseToken).safeTransferFrom(msg.sender, address(this), baseTokenAmount);
-            require(msg.value == 0, "OTCTrading: ETH not needed for SELL order");
+        // What the maker must put up: base tokens (SELL), or the counterparty amount plus the maker
+        // fee (BUY). The maker bears the maker fee; the taker bears the taker fee at fill time.
+        (address fundToken, uint256 fundAmount) =
+            _makerObligation(orderType, counterpartyToken, baseTokenAmount, counterpartyTokenAmount);
+
+        uint256 escrow = 0;
+        if (orderType == OrderType.BUY && _isETH(counterpartyToken)) {
+            // Only escrowed case: ETH must be pre-funded, it cannot be pulled at fill time.
+            require(msg.value == fundAmount, "OTCTrading: incorrect ETH amount");
+            escrow = msg.value;
         } else {
-            // BUY order: maker deposits the counterparty amount PLUS the maker fee.
-            // The maker (buyer) bears the maker fee; the taker (seller) bears the
-            // taker fee, deducted from proceeds at fill time. This mirrors the SELL
-            // path so the fee incidence follows the maker/taker roles consistently.
-            uint256 makerFeeDeposit = (counterpartyTokenAmount * makerFeeBps) / 10000;
-            uint256 totalDeposit = counterpartyTokenAmount + makerFeeDeposit;
-            if (_isETH(counterpartyToken)) {
-                require(msg.value == totalDeposit, "OTCTrading: incorrect ETH amount");
-            } else {
-                require(msg.value == 0, "OTCTrading: ETH not needed for ERC20 token");
-                IERC20(counterpartyToken).safeTransferFrom(msg.sender, address(this), totalDeposit);
-            }
+            // Allowance-backed: nothing is deposited, so no ETH may be sent.
+            require(msg.value == 0, "OTCTrading: ETH not needed");
+            require(IERC20(fundToken).allowance(msg.sender, address(this)) >= fundAmount, "OTCTrading: approve first");
+            require(IERC20(fundToken).balanceOf(msg.sender) >= fundAmount, "OTCTrading: insufficient balance");
         }
 
         // Calculate expiration
@@ -388,6 +471,9 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
 
         // Create order
         orderId = nextOrderId++;
+        if (escrow > 0) {
+            ethEscrowed[orderId] = escrow;
+        }
         orders[orderId] = Order({
             id: orderId,
             maker: msg.sender,
@@ -410,17 +496,26 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
 
     /**
      * @dev Fill an order (partially or fully)
+     *
+     * Both legs move directly between maker and taker; the contract never takes custody. The taker
+     * sends ETH only when buying base off a SELL order priced in ETH (excess is refunded). When
+     * selling base into a BUY order priced in ETH, the taker's proceeds are paid out of the maker's
+     * escrow.
+     *
      * @param orderId ID of the order to fill
      * @param baseTokenAmount Amount of base token to fill
      */
     function fillOrder(uint256 orderId, uint256 baseTokenAmount) external payable nonReentrant whenNotPaused {
-        // Check whitelist requirement
-        if (requireWhitelist) {
-            require(whitelist[msg.sender], "OTCTrading: not whitelisted");
-        }
-
         Order storage order = orders[orderId];
         require(order.isActive, "OTCTrading: order not active");
+
+        // Check whitelist requirement for BOTH sides: a de-whitelisted maker's resting orders must
+        // stop trading, not just be barred from creating new ones.
+        if (requireWhitelist) {
+            require(whitelist[msg.sender], "OTCTrading: not whitelisted");
+            require(whitelist[order.maker], "OTCTrading: maker not whitelisted");
+        }
+
         require(order.expiresAt == 0 || block.timestamp < order.expiresAt, "OTCTrading: order expired");
         require(order.maker != msg.sender, "OTCTrading: cannot fill own order");
         require(baseTokenAmount > 0, "OTCTrading: invalid fill amount");
@@ -432,144 +527,88 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         uint256 counterpartyTokenAmount = (baseTokenAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
 
         // Reject fills whose settlement rounds down to zero counterparty tokens.
-        // Without this, a taker could repeatedly claim base tokens while paying
-        // nothing (SELL) or drain the maker's deposit (BUY) via rounding dust.
+        // Without this, a taker could repeatedly claim base tokens while paying nothing.
         require(counterpartyTokenAmount > 0, "OTCTrading: amount rounds to zero");
 
-        if (order.orderType == OrderType.SELL) {
-            // SELL order: Maker is selling base tokens for counterparty tokens
-            // Maker has base tokens in contract, wants counterparty tokens
-            // Taker provides counterparty tokens, receives base tokens
+        // Fees use the order's snapshotted rates. The maker always bears the maker fee and the taker
+        // the taker fee, in both directions.
+        uint256 makerFee = (counterpartyTokenAmount * order.makerFeeBps) / 10000;
+        uint256 takerFee = (counterpartyTokenAmount * order.takerFeeBps) / 10000;
+        uint256 totalFee = makerFee + takerFee;
 
-            // Calculate fees on counterparty tokens using the order's snapshotted rates
-            uint256 makerFee = (counterpartyTokenAmount * order.makerFeeBps) / 10000;
-            uint256 takerFee = (counterpartyTokenAmount * order.takerFeeBps) / 10000;
+        bool isEth = _isETH(order.counterpartyToken);
+        bool isSell = order.orderType == OrderType.SELL;
+        address maker = order.maker;
 
-            if (_isETH(order.counterpartyToken)) {
-                // ETH counterparty: taker sends ETH
-                require(msg.value >= counterpartyTokenAmount + takerFee, "OTCTrading: insufficient ETH sent");
-
-                // Refund excess ETH if any
-                if (msg.value > counterpartyTokenAmount + takerFee) {
-                    (bool refundSuccess,) =
-                        payable(msg.sender).call{value: msg.value - counterpartyTokenAmount - takerFee}("");
-                    require(refundSuccess, "OTCTrading: ETH refund failed");
-                }
-
-                // Transfer ETH to maker (minus maker fee)
-                (bool makerSuccess,) = payable(order.maker).call{value: counterpartyTokenAmount - makerFee}("");
-                require(makerSuccess, "OTCTrading: ETH transfer to maker failed");
-
-                // Transfer fees to fee recipient
-                if (makerFee > 0) {
-                    (bool makerFeeSuccess,) = payable(feeRecipient).call{value: makerFee}("");
-                    require(makerFeeSuccess, "OTCTrading: ETH fee transfer failed");
-                }
-                if (takerFee > 0) {
-                    (bool takerFeeSuccess,) = payable(feeRecipient).call{value: takerFee}("");
-                    require(takerFeeSuccess, "OTCTrading: ETH fee transfer failed");
-                }
-            } else {
-                // ERC20 counterparty
-                require(msg.value == 0, "OTCTrading: ETH not needed for ERC20 token");
-
-                // Transfer counterparty tokens from taker (including taker fee)
-                IERC20(order.counterpartyToken)
-                    .safeTransferFrom(msg.sender, address(this), counterpartyTokenAmount + takerFee);
-
-                // Transfer counterparty tokens to maker (minus maker fee)
-                IERC20(order.counterpartyToken).safeTransfer(order.maker, counterpartyTokenAmount - makerFee);
-
-                // Transfer fees to fee recipient
-                if (makerFee > 0) {
-                    IERC20(order.counterpartyToken).safeTransfer(feeRecipient, makerFee);
-                }
-                if (takerFee > 0) {
-                    IERC20(order.counterpartyToken).safeTransfer(feeRecipient, takerFee);
-                }
-            }
-
-            // Transfer base tokens to taker
-            IERC20(baseToken).safeTransfer(msg.sender, baseTokenAmount);
-
-            emit OrderFilled(orderId, msg.sender, baseTokenAmount, counterpartyTokenAmount, makerFee, takerFee);
+        // The taker only ever SENDS ETH when buying base off a SELL order priced in ETH.
+        uint256 takerOwes = counterpartyTokenAmount + takerFee;
+        if (isEth && isSell) {
+            require(msg.value >= takerOwes, "OTCTrading: insufficient ETH sent");
         } else {
-            // BUY order: Maker is buying base tokens with counterparty tokens
-            // Maker has counterparty tokens in contract, wants base tokens
-            // Taker provides base tokens, receives counterparty tokens
-
-            // Calculate fees on counterparty tokens using the order's snapshotted rates.
-            // The maker fee was pre-funded by the maker at creation; the taker fee is
-            // deducted from the taker's (seller's) proceeds here. Total disbursed is
-            // `settlement + makerFee`, which is exactly what the maker deposited for
-            // this fill, so the contract stays solvent.
-            uint256 makerFee = (counterpartyTokenAmount * order.makerFeeBps) / 10000;
-            uint256 takerFee = (counterpartyTokenAmount * order.takerFeeBps) / 10000;
-            uint256 takerProceeds = counterpartyTokenAmount - takerFee;
-
-            // Transfer base tokens from taker
             require(msg.value == 0, "OTCTrading: ETH not needed");
-            IERC20(baseToken).safeTransferFrom(msg.sender, address(this), baseTokenAmount);
-
-            // Transfer base tokens to maker
-            IERC20(baseToken).safeTransfer(order.maker, baseTokenAmount);
-
-            uint256 totalFee = makerFee + takerFee;
-
-            if (_isETH(order.counterpartyToken)) {
-                // ETH counterparty: transfer ETH to taker (minus taker fee)
-                (bool takerSuccess,) = payable(msg.sender).call{value: takerProceeds}("");
-                require(takerSuccess, "OTCTrading: ETH transfer to taker failed");
-
-                // Transfer fees to fee recipient (from ETH held by contract)
-                if (totalFee > 0) {
-                    (bool feeSuccess,) = payable(feeRecipient).call{value: totalFee}("");
-                    require(feeSuccess, "OTCTrading: ETH fee transfer failed");
-                }
-            } else {
-                // ERC20 counterparty: transfer to taker (minus taker fee)
-                IERC20(order.counterpartyToken).safeTransfer(msg.sender, takerProceeds);
-
-                // Transfer fees to fee recipient (from counterparty tokens held by contract)
-                if (totalFee > 0) {
-                    IERC20(order.counterpartyToken).safeTransfer(feeRecipient, totalFee);
-                }
-            }
-
-            emit OrderFilled(orderId, msg.sender, baseTokenAmount, counterpartyTokenAmount, makerFee, takerFee);
         }
 
-        // Update order
+        // ---- Effects: finish all state writes before any transfer or call ----
         order.filledAmount += baseTokenAmount;
-        if (order.filledAmount >= order.baseTokenAmount) {
+        bool nowComplete = order.filledAmount >= order.baseTokenAmount;
+        if (nowComplete) {
             order.isActive = false;
         }
-    }
+        if (isEth && !isSell) {
+            // Draw this fill's cost out of the maker's escrow: taker proceeds + both fees.
+            ethEscrowed[orderId] -= counterpartyTokenAmount + makerFee;
+            // On the closing fill, return any rounding dust so escrow accounting never strands ETH.
+            if (nowComplete && ethEscrowed[orderId] > 0) {
+                uint256 dust = ethEscrowed[orderId];
+                ethEscrowed[orderId] = 0;
+                emit EthEscrowRefunded(orderId, maker, dust);
+                _creditETH(maker, dust);
+            }
+        }
 
-    /**
-     * @dev Refund the unfilled portion of a BUY order to its maker: the remaining
-     * counterparty amount plus the still-unused maker-fee that was pre-funded at
-     * creation. Using the same floor-division basis as fills guarantees the sum of
-     * all fill outflows and this refund never exceeds the maker's original deposit.
-     * @param order Storage reference to the BUY order
-     * @param remainingBaseAmount Unfilled base amount
-     */
-    function _refundBuyOrder(Order storage order, uint256 remainingBaseAmount) private {
-        uint256 remainingCounterpartyAmount =
-            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
-        uint256 makerFeeRefund = (remainingCounterpartyAmount * order.makerFeeBps) / 10000;
-        uint256 refund = remainingCounterpartyAmount + makerFeeRefund;
+        emit OrderFilled(orderId, msg.sender, baseTokenAmount, counterpartyTokenAmount, makerFee, takerFee);
 
-        if (_isETH(order.counterpartyToken)) {
-            (bool success,) = payable(order.maker).call{value: refund}("");
-            require(success, "OTCTrading: ETH refund failed");
+        // ---- Interactions ----
+        // ETH owed to resting parties (maker proceeds, fees) is CREDITED (pull-payment); only the
+        // active taker (msg.sender) is paid inline.
+        if (isSell) {
+            // SELL order: maker sells base tokens, taker pays the counterparty side.
+            IERC20(baseToken).safeTransferFrom(maker, msg.sender, baseTokenAmount);
+
+            if (isEth) {
+                _creditETH(maker, counterpartyTokenAmount - makerFee);
+                _creditETH(feeRecipient, totalFee);
+                if (msg.value > takerOwes) {
+                    _sendETH(msg.sender, msg.value - takerOwes);
+                }
+            } else {
+                IERC20 cpt = IERC20(order.counterpartyToken);
+                cpt.safeTransferFrom(msg.sender, maker, counterpartyTokenAmount - makerFee);
+                if (totalFee > 0) {
+                    cpt.safeTransferFrom(msg.sender, feeRecipient, totalFee);
+                }
+            }
         } else {
-            IERC20(order.counterpartyToken).safeTransfer(order.maker, refund);
+            // BUY order: maker buys base tokens, taker sells them.
+            IERC20(baseToken).safeTransferFrom(msg.sender, maker, baseTokenAmount);
+
+            if (isEth) {
+                // Credit fees first (state), then pay the taker inline last (CEI).
+                _creditETH(feeRecipient, totalFee);
+                _sendETH(msg.sender, counterpartyTokenAmount - takerFee);
+            } else {
+                IERC20 cpt = IERC20(order.counterpartyToken);
+                cpt.safeTransferFrom(maker, msg.sender, counterpartyTokenAmount - takerFee);
+                if (totalFee > 0) {
+                    cpt.safeTransferFrom(maker, feeRecipient, totalFee);
+                }
+            }
         }
     }
 
     /**
-     * @dev Cancel an order
+     * @dev Cancel an order. Allowance-backed orders simply go inactive (no funds move); a BUY+ETH
+     * order's unfilled escrow is refunded to the maker.
      * @param orderId ID of the order to cancel
      */
     function cancelOrder(uint256 orderId) external nonReentrant {
@@ -577,21 +616,61 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         require(order.maker == msg.sender, "OTCTrading: not order maker");
         require(order.isActive, "OTCTrading: order not active");
 
-        uint256 remainingBaseAmount = order.baseTokenAmount - order.filledAmount;
-        require(remainingBaseAmount > 0, "OTCTrading: no remaining amount");
-
-        if (order.orderType == OrderType.SELL) {
-            // SELL order: return remaining base tokens to maker
-            IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
-        } else {
-            // BUY order: return remaining counterparty tokens + unused maker fee
-            _refundBuyOrder(order, remainingBaseAmount);
-        }
-
-        // Mark order as inactive
         order.isActive = false;
 
         emit OrderCancelled(orderId, msg.sender);
+
+        _refundEscrow(orderId, msg.sender);
+    }
+
+    /**
+     * @dev Batch cancel orders (only own orders)
+     * @param orderIds Array of order IDs to cancel
+     */
+    function batchCancelOrders(uint256[] calldata orderIds) external nonReentrant {
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            Order storage order = orders[orderIds[i]];
+            if (order.maker == msg.sender && order.isActive) {
+                order.isActive = false;
+                emit OrderCancelled(orderIds[i], msg.sender);
+                _refundEscrow(orderIds[i], msg.sender);
+            }
+        }
+    }
+
+    /**
+     * @dev Cleanup expired orders. Permissionless: expiry is deterministic and ungameable, and the
+     * caller gains nothing — a BUY+ETH order's escrow is refunded to its MAKER, never to the caller.
+     * An underfunded (but unexpired) order is NOT cleanable by third parties, because underfunding is
+     * transient; use {isOrderFundable} off-chain and let the maker cancel.
+     * @param orderIds Array of order IDs to cleanup
+     * @return cleanedCount Number of orders cleaned up
+     */
+    function cleanupExpiredOrders(uint256[] calldata orderIds) external nonReentrant returns (uint256 cleanedCount) {
+        uint256 cleaned = 0;
+        for (uint256 i = 0; i < orderIds.length; i++) {
+            Order storage order = orders[orderIds[i]];
+            if (order.isActive && order.expiresAt > 0 && block.timestamp >= order.expiresAt) {
+                address maker = order.maker;
+                order.isActive = false;
+                cleaned++;
+                _refundEscrow(orderIds[i], maker);
+            }
+        }
+        emit OrdersCleanedUp(orderIds);
+        return cleaned;
+    }
+
+    /**
+     * @dev Withdraw your accrued ETH (maker proceeds, escrow refunds, or fees). Pull-payment
+     * counterpart to the credits booked during fills and cancellations.
+     */
+    function withdraw() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "OTCTrading: nothing to withdraw");
+        pendingWithdrawals[msg.sender] = 0;
+        emit Withdrawn(msg.sender, amount);
+        _sendETH(msg.sender, amount);
     }
 
     // ============ View Functions ============
@@ -641,6 +720,30 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
             return false;
         }
         return block.timestamp >= order.expiresAt;
+    }
+
+    /**
+     * @dev Check whether an order can currently be filled for its remaining amount. Because orders
+     * are allowance-backed, a maker can move funds or revoke their approval at any time, so this is
+     * a transient property: a false result does NOT deactivate the order. Frontends and relayers use
+     * this to filter the book. A BUY+ETH order is escrowed and so is always fundable while live.
+     * @param orderId ID of the order
+     * @return True if the maker's side is currently covered
+     */
+    function isOrderFundable(uint256 orderId) public view returns (bool) {
+        Order storage order = orders[orderId];
+        if (!order.isActive) {
+            return false;
+        }
+        if (order.expiresAt > 0 && block.timestamp >= order.expiresAt) {
+            return false;
+        }
+        (address token, uint256 need) = _makerObligationRemaining(orderId);
+        if (_isETH(token)) {
+            return ethEscrowed[orderId] >= need;
+        }
+        return
+            IERC20(token).allowance(order.maker, address(this)) >= need && IERC20(token).balanceOf(order.maker) >= need;
     }
 
     /**
@@ -722,88 +825,80 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardT
         return orderIds;
     }
 
+    // ============ Internal Helpers ============
+
     /**
-     * @dev Batch cancel orders (only own orders)
-     * @param orderIds Array of order IDs to cancel
+     * @dev Send native ETH to the ACTIVE caller, reverting loudly on failure. Used only for inline
+     * payouts to msg.sender (taker proceeds / excess refund); resting parties are credited instead.
      */
-    function batchCancelOrders(uint256[] calldata orderIds) external nonReentrant {
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            Order storage order = orders[orderIds[i]];
-            if (order.maker == msg.sender && order.isActive) {
-                uint256 remainingBaseAmount = order.baseTokenAmount - order.filledAmount;
-                if (remainingBaseAmount > 0) {
-                    if (order.orderType == OrderType.SELL) {
-                        IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
-                    } else {
-                        _refundBuyOrder(order, remainingBaseAmount);
-                    }
-                    order.isActive = false;
-                    emit OrderCancelled(orderIds[i], msg.sender);
-                }
-            }
+    function _sendETH(address to, uint256 amount) private {
+        if (amount == 0) {
+            return;
         }
+        (bool success,) = payable(to).call{value: amount}("");
+        require(success, "OTCTrading: ETH transfer failed");
     }
 
     /**
-     * @dev Cleanup expired orders (admin only)
-     * @param orderIds Array of order IDs to cleanup
-     * @return cleanedCount Number of orders cleaned up
+     * @dev Book ETH as claimable for `to` (pull-payment). Never reverts on a hostile recipient, so a
+     * maker/fee-recipient that cannot receive ETH can never block settlement or a cancel.
      */
-    function cleanupExpiredOrders(uint256[] calldata orderIds)
-        external
-        onlyRole(ADMIN_ROLE)
-        nonReentrant
-        returns (uint256 cleanedCount)
-    {
-        uint256 cleaned = 0;
-        for (uint256 i = 0; i < orderIds.length; i++) {
-            Order storage order = orders[orderIds[i]];
-            if (order.isActive && order.expiresAt > 0 && block.timestamp >= order.expiresAt) {
-                uint256 remainingBaseAmount = order.baseTokenAmount - order.filledAmount;
-                if (remainingBaseAmount > 0) {
-                    if (order.orderType == OrderType.SELL) {
-                        IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
-                    } else {
-                        _refundBuyOrder(order, remainingBaseAmount);
-                    }
-                }
-                order.isActive = false;
-                cleaned++;
-            }
+    function _creditETH(address to, uint256 amount) private {
+        if (amount == 0) {
+            return;
         }
-        emit OrdersCleanedUp(orderIds);
-        return cleaned;
+        pendingWithdrawals[to] += amount;
+        emit EthCredited(to, amount);
     }
 
     /**
-     * @dev Emergency withdrawal function (admin only)
-     * @param token Token address (address(0) for ETH)
-     * @param to Recipient address
-     * @param amount Amount to withdraw (0 = all balance)
-     * @notice Only callable while the contract is paused, so an emergency
-     * withdrawal is always preceded by a visible on-chain pause.
+     * @dev Return a BUY+ETH order's unfilled escrow to its maker and zero the accounting. No-op for
+     * every other order kind (nothing is ever escrowed for them). Callers must have already
+     * deactivated the order; the balance is zeroed before crediting.
+     * @param orderId ID of the order whose escrow is being released
+     * @param maker The order's maker — the only valid recipient
      */
-    function emergencyWithdraw(address token, address to, uint256 amount)
-        external
-        onlyRole(ADMIN_ROLE)
-        nonReentrant
-        whenPaused
-    {
-        require(to != address(0), "OTCTrading: invalid recipient");
-
-        if (_isETH(token)) {
-            uint256 balance = address(this).balance;
-            uint256 withdrawAmount = amount == 0 ? balance : amount;
-            require(withdrawAmount <= balance, "OTCTrading: insufficient balance");
-            (bool success,) = payable(to).call{value: withdrawAmount}("");
-            require(success, "OTCTrading: ETH transfer failed");
-            emit EmergencyWithdrawal(token, to, withdrawAmount);
-        } else {
-            uint256 balance = IERC20(token).balanceOf(address(this));
-            uint256 withdrawAmount = amount == 0 ? balance : amount;
-            require(withdrawAmount <= balance, "OTCTrading: insufficient balance");
-            IERC20(token).safeTransfer(to, withdrawAmount);
-            emit EmergencyWithdrawal(token, to, withdrawAmount);
+    function _refundEscrow(uint256 orderId, address maker) private {
+        uint256 amount = ethEscrowed[orderId];
+        if (amount == 0) {
+            return;
         }
+        ethEscrowed[orderId] = 0;
+        emit EthEscrowRefunded(orderId, maker, amount);
+        _creditETH(maker, amount);
+    }
+
+    /**
+     * @dev What a maker must put up to fully back a fresh order: base tokens (SELL) or the
+     * counterparty amount plus the maker fee (BUY). If `token` is ETH the obligation is met by
+     * escrowing `amount` as msg.value; otherwise by an allowance.
+     */
+    function _makerObligation(
+        OrderType orderType,
+        address counterpartyToken,
+        uint256 baseTokenAmount,
+        uint256 counterpartyTokenAmount
+    ) private view returns (address token, uint256 amount) {
+        if (orderType == OrderType.SELL) {
+            return (baseToken, baseTokenAmount);
+        }
+        uint256 makerFeeDeposit = (counterpartyTokenAmount * makerFeeBps) / 10000;
+        return (counterpartyToken, counterpartyTokenAmount + makerFeeDeposit);
+    }
+
+    /**
+     * @dev Same as {_makerObligation} but for an order's REMAINING unfilled part, using the order's
+     * snapshotted fee rate. Used by {isOrderFundable}.
+     */
+    function _makerObligationRemaining(uint256 orderId) private view returns (address token, uint256 amount) {
+        Order storage order = orders[orderId];
+        uint256 remainingBaseAmount = order.baseTokenAmount - order.filledAmount;
+        if (order.orderType == OrderType.SELL) {
+            return (baseToken, remainingBaseAmount);
+        }
+        uint256 remainingCounterpartyAmount =
+            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
+        uint256 makerFeeRemaining = (remainingCounterpartyAmount * order.makerFeeBps) / 10000;
+        return (order.counterpartyToken, remainingCounterpartyAmount + makerFeeRemaining);
     }
 }

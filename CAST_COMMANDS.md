@@ -98,6 +98,16 @@ cast call $OTC_ADDRESS "nextOrderId()(uint256)" --rpc-url $RPC_URL
 cast call $OTC_ADDRESS "paused()(bool)" --rpc-url $RPC_URL
 ```
 
+### Check ETH Escrowed for a BUY+ETH Order
+```bash
+cast call $OTC_ADDRESS "ethEscrowed(uint256)(uint256)" <ORDER_ID> --rpc-url $RPC_URL
+```
+
+### Check Claimable ETH (pending withdrawal) for an Address
+```bash
+cast call $OTC_ADDRESS "pendingWithdrawals(address)(uint256)" <ADDRESS> --rpc-url $RPC_URL
+```
+
 ---
 
 ## 2. Order Operations
@@ -134,13 +144,25 @@ cast call $OTC_ADDRESS "getUserOrders(address)(uint256[])" <USER_ADDRESS> --rpc-
 cast call $OTC_ADDRESS "getUserOrders(address)(uint256[])" $USER1 --rpc-url $RPC_URL
 ```
 
+### Check if an Order is Currently Fundable
+```bash
+# True if the maker's side is currently covered (allowance+balance, or ETH escrow).
+# A false result does NOT deactivate the order — fundability is transient. Use this to filter the book.
+cast call $OTC_ADDRESS "isOrderFundable(uint256)(bool)" <ORDER_ID> --rpc-url $RPC_URL
+```
+
 ---
 
 ## 3. Trading Functions
 
 ### Create Order
 
-First, approve base tokens:
+> **Non-custodial:** approving grants an **allowance** — your tokens stay in your wallet until a
+> taker fills. (Exception: a BUY order priced in ETH escrows `msg.value` at creation, since ETH
+> can't be pulled later.) A SELL maker approves the base token; a BUY maker approves
+> `counterpartyTokenAmount + makerFee` of the counterparty token.
+
+First, approve the base token (SELL) — an allowance, not a transfer:
 ```bash
 cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS <AMOUNT> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
@@ -232,6 +254,18 @@ cast send $OTC_ADDRESS "cancelOrder(uint256)" <ORDER_ID> --private-key $PRIVATE_
 cast send $OTC_ADDRESS "cancelOrder(uint256)" 1 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
 
+### Withdraw Accrued ETH (pull payment)
+```bash
+# Claim ETH owed to you: maker proceeds, escrow refunds, or (for the fee recipient) fees.
+cast send $OTC_ADDRESS "withdraw()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+```
+
+### Cleanup Expired Orders (permissionless)
+```bash
+# Anyone may deactivate expired orders; BUY+ETH escrow is credited back to each maker.
+cast send $OTC_ADDRESS "cleanupExpiredOrders(uint256[])" "[1,2,3]" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+```
+
 ---
 
 ## 4. Admin Functions
@@ -321,6 +355,16 @@ cast send $OTC_ADDRESS "updateFeeRecipient(address)" <NEW_FEE_RECIPIENT> --priva
 cast send $OTC_ADDRESS "updateFeeRecipient(address)" 0xNewFeeRecipient --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
 
+### Admin Force-Cancel an Order (compliance)
+```bash
+# Deactivates any active order (e.g. a de-whitelisted maker's). Non-custodial: any BUY+ETH escrow
+# is credited back to the MAKER, never to the admin. Emits OrderAdminCancelled.
+cast send $OTC_ADDRESS "adminCancelOrder(uint256)" <ORDER_ID> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+
+# Batch variant:
+cast send $OTC_ADDRESS "adminCancelOrders(uint256[])" "[1,2,3]" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+```
+
 ### Pause Trading
 ```bash
 cast send $OTC_ADDRESS "pause()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
@@ -350,10 +394,10 @@ ADMIN_ROLE=$(cast keccak "ADMIN_ROLE")
 cast call $OTC_ADDRESS "hasRole(bytes32,address)(bool)" $ADMIN_ROLE <ADDRESS> --rpc-url $RPC_URL
 ```
 
-### Check if Address has FEE_RECIPIENT_ROLE
+### Check if Address has UPGRADER_ROLE
 ```bash
-FEE_RECIPIENT_ROLE=$(cast keccak "FEE_RECIPIENT_ROLE")
-cast call $OTC_ADDRESS "hasRole(bytes32,address)(bool)" $FEE_RECIPIENT_ROLE <ADDRESS> --rpc-url $RPC_URL
+UPGRADER_ROLE=$(cast keccak "UPGRADER_ROLE")
+cast call $OTC_ADDRESS "hasRole(bytes32,address)(bool)" $UPGRADER_ROLE <ADDRESS> --rpc-url $RPC_URL
 ```
 
 ---
@@ -437,7 +481,7 @@ cast call $COUNTERPARTY_TOKEN "balanceOf(address)(uint256)" $ADMIN --rpc-url $RP
 ```bash
 echo "DEFAULT_ADMIN_ROLE: 0x0000000000000000000000000000000000000000000000000000000000000000"
 echo "ADMIN_ROLE: $(cast keccak "ADMIN_ROLE")"
-echo "FEE_RECIPIENT_ROLE: $(cast keccak "FEE_RECIPIENT_ROLE")"
+echo "UPGRADER_ROLE: $(cast keccak "UPGRADER_ROLE")"
 ```
 
 ### Calculate fees
@@ -506,12 +550,13 @@ cast logs --from-block 0 "OrderCancelled(uint256,address)" --rpc-url $RPC_URL
 - For USDC (6 decimals): 1 USDC = 1000000
 - Always approve tokens before creating or filling orders
 - Order type is the first `createOrder` argument: `0` = BUY, `1` = SELL
+- **Non-custodial:** makers grant an allowance and keep custody; nothing is escrowed except a BUY order priced in ETH (which sends `counterpartyAmount + makerFee` as `msg.value`)
 - **SELL orders:** the taker pays `counterpartyAmount + takerFee`; the maker receives `counterpartyAmount − makerFee`
-- **BUY orders:** the maker deposits `counterpartyAmount + makerFee` at creation; the taker (seller) receives `counterpartyAmount − takerFee`
+- **BUY orders:** the maker provides `counterpartyAmount + makerFee` (allowance, or ETH escrow); the taker (seller) receives `counterpartyAmount − takerFee`
 - The order creator (maker) always bears the maker fee; the filler (taker) always bears the taker fee
+- **ETH payouts are pull-based:** maker proceeds, escrow refunds, and fees accrue as `pendingWithdrawals` and are claimed with `withdraw()`; only the taker is paid inline
 - Fee rates are snapshotted per order at creation and are not affected by later `updateFees` calls
 - Orders can be filled partially or fully
-- Only the order maker can cancel their order
-- `emergencyWithdraw` can only be called while the contract is paused
+- Only the order maker can cancel their own order; `ADMIN_ROLE` can force-cancel (escrow returns to the maker); anyone can `cleanupExpiredOrders`
 - When using testnet, replace `$RPC_URL` with your testnet RPC URL and use appropriate private keys
 - Always verify you have the required role before attempting admin operations

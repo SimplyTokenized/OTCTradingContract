@@ -1,1960 +1,732 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.27;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {OTCTrading} from "../src/OTCTrading.sol";
-import {Upgrades} from "@openzeppelin-foundry-upgrades/Upgrades.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {Upgrades} from "@openzeppelin-foundry-upgrades/Upgrades.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
-// Mock ERC20 tokens for testing
 contract MockERC20 is ERC20 {
-    constructor(string memory name, string memory symbol) ERC20(name, symbol) {
-        _mint(msg.sender, 1000000 * 10 ** decimals());
-    }
+    constructor(string memory n, string memory s) ERC20(n, s) {}
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
     }
 }
 
+/// @dev A maker/taker contract that refuses to receive ETH (used to prove payouts revert loudly).
+contract EthRejecter {
+    function createBuyEth(OTCTrading otc, uint256 baseAmt, uint256 cptAmt) external payable returns (uint256) {
+        return otc.createOrder{value: msg.value}(OTCTrading.OrderType.BUY, address(0), baseAmt, cptAmt);
+    }
+}
+
 contract OTCTradingTest is Test {
-    OTCTrading public otc;
-    MockERC20 public baseToken;
-    MockERC20 public usdc;
-    address public admin;
-    address public feeRecipient;
-    address public user1;
-    address public user2;
+    OTCTrading otc;
+    MockERC20 base;
+    MockERC20 usdc;
+
+    address constant ETH = address(0);
+
+    address admin = address(this);
+    address feeRecipient = address(0xFEE);
+    address user1 = address(0xA11CE); // maker
+    address user2 = address(0xB0B); // taker
+
+    uint256 constant MAKER_BPS = 25;
+    uint256 constant TAKER_BPS = 50;
 
     function setUp() public {
-        admin = address(this);
-        feeRecipient = address(0x123);
-        user1 = address(0x1);
-        user2 = address(0x2);
-
-        // Deploy mock tokens
-        baseToken = new MockERC20("Base Token", "BASE");
+        base = new MockERC20("Base", "BASE");
         usdc = new MockERC20("USD Coin", "USDC");
 
-        // Deploy OTC contract with proxy
-        // Initialize with same defaults as original implementation:
-        // makerFeeBps = 25 (0.25%), takerFeeBps = 50 (0.5%),
-        // minOrderSize = 100, maxOrderSize = 0 (no max),
-        // defaultOrderExpiration = 0 (no expiration),
-        // requireWhitelist = true.
-        address proxyAddress = Upgrades.deployTransparentProxy(
+        // Deploy behind a UUPS proxy (also runs the OZ upgrade-safety validator).
+        address proxy = Upgrades.deployUUPSProxy(
             "OTCTrading.sol",
-            admin,
             abi.encodeCall(
-                OTCTrading.initialize, (address(baseToken), address(usdc), feeRecipient, admin, 25, 50, 100, 0, 0, true)
+                OTCTrading.initialize,
+                (address(base), address(usdc), feeRecipient, admin, MAKER_BPS, TAKER_BPS, 100, 0, 0, true)
             )
         );
+        otc = OTCTrading(proxy);
+        otc.addCounterpartyToken(ETH); // enable native-ETH-denominated orders
 
-        otc = OTCTrading(payable(proxyAddress));
-
-        // Setup: mint tokens to users
-        baseToken.mint(user1, 10000 * 10 ** baseToken.decimals());
-        baseToken.mint(user2, 10000 * 10 ** baseToken.decimals());
-        usdc.mint(user1, 100000 * 10 ** usdc.decimals());
-        usdc.mint(user2, 100000 * 10 ** usdc.decimals());
-
-        // Add users to whitelist
-        vm.prank(admin);
         otc.addToWhitelist(user1);
-        vm.prank(admin);
         otc.addToWhitelist(user2);
+
+        base.mint(user1, 100_000e18);
+        base.mint(user2, 100_000e18);
+        usdc.mint(user1, 100_000e18);
+        usdc.mint(user2, 100_000e18);
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
     }
 
-    function test_Initialization() public {
-        assertEq(address(otc.baseToken()), address(baseToken));
-        assertEq(otc.feeRecipient(), feeRecipient);
-        assertEq(otc.makerFeeBps(), 25); // 0.25%
-        assertEq(otc.takerFeeBps(), 50); // 0.5%
-        assertEq(otc.minOrderSize(), 100);
-        assertTrue(otc.requireWhitelist());
-        assertTrue(otc.allowedCounterpartyTokens(address(usdc)));
+    /// @dev Wrap a single order id as the calldata array cleanupExpiredOrders/batch* expect.
+    function _ids(uint256 id) internal pure returns (uint256[] memory arr) {
+        arr = new uint256[](1);
+        arr[0] = id;
     }
 
-    function test_CreateOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
+    // ---------- createOrder ----------
 
+    function test_CreateSell_NoFundsMoved() public {
         vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
+        base.approve(address(otc), 1000e18);
+        uint256 balBefore = base.balanceOf(user1);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
         vm.stopPrank();
 
-        assertEq(orderId, 1);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertEq(order.maker, user1);
-        assertEq(uint256(order.orderType), uint256(OTCTrading.OrderType.SELL));
-        assertEq(order.counterpartyToken, address(usdc));
-        assertEq(order.baseTokenAmount, baseAmount);
-        assertEq(order.counterpartyTokenAmount, usdcAmount);
-        assertTrue(order.isActive);
+        assertEq(id, 1);
+        assertEq(base.balanceOf(user1), balBefore, "no escrow: balance unchanged");
+        assertEq(base.balanceOf(address(otc)), 0, "core holds nothing");
+        assertTrue(otc.getOrder(id).isActive);
     }
 
-    function test_FillOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fill order
-        uint256 fillAmount = 500 * 10 ** baseToken.decimals();
-        uint256 expectedUsdcAmount = (fillAmount * usdcAmount) / baseAmount;
-        uint256 makerFee = (fillAmount * otc.makerFeeBps()) / 10000; // Maker fee on base token amount
-        uint256 takerFee = (expectedUsdcAmount * otc.takerFeeBps()) / 10000;
-
-        uint256 user1InitialUsdc = usdc.balanceOf(user1);
-        uint256 user2InitialBase = baseToken.balanceOf(user2);
-
-        vm.startPrank(user2);
-        usdc.approve(address(otc), expectedUsdcAmount + takerFee);
-        otc.fillOrder(orderId, fillAmount);
-        vm.stopPrank();
-
-        // Check balances
-        assertEq(baseToken.balanceOf(user2), user2InitialBase + fillAmount);
-        // Maker receives: expectedUsdcAmount - makerFee (maker fee is calculated on counterparty tokens)
-        uint256 makerFeeInUsdc = (expectedUsdcAmount * otc.makerFeeBps()) / 10000;
-        assertEq(usdc.balanceOf(user1), user1InitialUsdc + expectedUsdcAmount - makerFeeInUsdc);
-    }
-
-    function test_CancelOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        uint256 balanceBefore = baseToken.balanceOf(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-
-        // Check that tokens were returned
-        assertEq(baseToken.balanceOf(user1), balanceBefore);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-    }
-
-    function test_WhitelistRequirement() public {
-        address nonWhitelisted = address(0x999);
-        usdc.mint(nonWhitelisted, 10000 * 10 ** usdc.decimals());
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(nonWhitelisted);
-        baseToken.mint(nonWhitelisted, baseAmount);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: not whitelisted");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_MinOrderSize() public {
-        uint256 baseAmount = 50; // Below minimum
-        uint256 usdcAmount = 100;
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: order size below minimum");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_AdminFunctions() public {
-        // Add new counterparty token
-        MockERC20 newToken = new MockERC20("New Token", "NEW");
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(newToken));
-        assertTrue(otc.allowedCounterpartyTokens(address(newToken)));
-
-        // Update fees
-        vm.prank(admin);
-        otc.updateFees(30, 60); // 0.3% maker, 0.6% taker
-        assertEq(otc.makerFeeBps(), 30);
-        assertEq(otc.takerFeeBps(), 60);
-
-        // Update min order size
-        vm.prank(admin);
-        otc.updateMinOrderSize(200);
-        assertEq(otc.minOrderSize(), 200);
-
-        // Update whitelist requirement
-        vm.prank(admin);
-        otc.updateWhitelistRequirement(false);
-        assertFalse(otc.requireWhitelist());
-    }
-
-    function test_PauseUnpause() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Pause
-        vm.prank(admin);
-        otc.pause();
-
-        // Try to create order (should fail)
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert();
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Unpause
-        vm.prank(admin);
-        otc.unpause();
-
-        // Now should work
-        vm.startPrank(user1);
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    // ============ ETH Tests ============
-
-    function test_AddETHAsCounterpartyToken() public {
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-        assertTrue(otc.allowedCounterpartyTokens(address(0)));
-    }
-
-    function test_CreateBuyOrderWithETH() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-        // BUY makers pre-fund the maker fee (Variant A), so the deposit is amount + makerFee.
-        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
-        uint256 totalDeposit = ethAmount + makerFeeDeposit;
-
-        vm.startPrank(user1);
-        vm.deal(user1, 10 ether); // Give user1 some ETH
-        uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: totalDeposit}(
-            OTCTrading.OrderType.BUY,
-            address(0), // ETH
-            baseAmount,
-            ethAmount
-        );
-        vm.stopPrank();
-
-        assertEq(orderId, 1);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertEq(order.maker, user1);
-        assertEq(uint256(order.orderType), uint256(OTCTrading.OrderType.BUY));
-        assertEq(order.counterpartyToken, address(0));
-        assertEq(order.baseTokenAmount, baseAmount);
-        assertEq(order.counterpartyTokenAmount, ethAmount);
-        assertTrue(order.isActive);
-
-        // Check ETH was deposited (amount + pre-funded maker fee)
-        assertEq(user1.balance, user1BalanceBefore - totalDeposit);
-        assertEq(address(otc).balance, totalDeposit);
-    }
-
-    function test_CreateSellOrderWithETHCounterparty() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(0), baseAmount, ethAmount);
-        vm.stopPrank();
-
-        assertEq(orderId, 1);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertEq(order.counterpartyToken, address(0));
-        assertEq(order.counterpartyTokenAmount, ethAmount);
-        assertTrue(order.isActive);
-    }
-
-    function test_FillSellOrderWithETH() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        // Create SELL order (user1 sells base tokens for ETH)
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(0), baseAmount, ethAmount);
-        vm.stopPrank();
-
-        // Fill order (user2 buys base tokens with ETH)
-        uint256 fillAmount = 500 * 10 ** baseToken.decimals();
-        uint256 expectedEthAmount = (fillAmount * ethAmount) / baseAmount;
-        uint256 makerFee = (expectedEthAmount * otc.makerFeeBps()) / 10000;
-        uint256 takerFee = (expectedEthAmount * otc.takerFeeBps()) / 10000;
-
-        uint256 user1EthBefore = user1.balance;
-        uint256 user2BaseBefore = baseToken.balanceOf(user2);
-        uint256 feeRecipientEthBefore = feeRecipient.balance;
-
-        vm.startPrank(user2);
-        vm.deal(user2, 10 ether); // Give user2 some ETH
-        otc.fillOrder{value: expectedEthAmount + takerFee}(orderId, fillAmount);
-        vm.stopPrank();
-
-        // Check balances
-        assertEq(baseToken.balanceOf(user2), user2BaseBefore + fillAmount);
-        assertEq(user1.balance, user1EthBefore + expectedEthAmount - makerFee);
-        assertEq(feeRecipient.balance, feeRecipientEthBefore + makerFee + takerFee);
-    }
-
-    function test_FillBuyOrderWithETH() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        // Create BUY order (user1 buys base tokens with ETH); maker pre-funds maker fee.
-        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
-        vm.startPrank(user1);
-        vm.deal(user1, 10 ether);
-        uint256 orderId = otc.createOrder{value: ethAmount + makerFeeDeposit}(
-            OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount
-        );
-        vm.stopPrank();
-
-        // Fill order (user2 sells base tokens for ETH)
-        uint256 fillAmount = 500 * 10 ** baseToken.decimals();
-        uint256 expectedEthAmount = (fillAmount * ethAmount) / baseAmount;
-        uint256 makerFee = (expectedEthAmount * otc.makerFeeBps()) / 10000;
-        uint256 takerFee = (expectedEthAmount * otc.takerFeeBps()) / 10000;
-
-        uint256 user1BaseBefore = baseToken.balanceOf(user1);
-        uint256 user2EthBefore = user2.balance;
-        uint256 feeRecipientEthBefore = feeRecipient.balance;
-
-        vm.startPrank(user2);
-        baseToken.approve(address(otc), fillAmount);
-        otc.fillOrder(orderId, fillAmount);
-        vm.stopPrank();
-
-        // Check balances
-        assertEq(baseToken.balanceOf(user1), user1BaseBefore + fillAmount);
-        // Variant A: maker fee was pre-funded; taker (seller) only bears the taker fee.
-        assertEq(user2.balance, user2EthBefore + expectedEthAmount - takerFee);
-        assertEq(feeRecipient.balance, feeRecipientEthBefore + makerFee + takerFee);
-    }
-
-    function test_CancelBuyOrderWithETH() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        // Create BUY order (maker pre-funds maker fee)
-        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
-        vm.startPrank(user1);
-        vm.deal(user1, 10 ether);
-        uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount + makerFeeDeposit}(
-            OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount
-        );
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-
-        // Check that the full deposit (amount + maker fee) was returned
-        assertEq(user1.balance, user1BalanceBefore);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-    }
-
-    function test_CreateBuyOrderWithETHIncorrectAmount() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        vm.startPrank(user1);
-        vm.deal(user1, 10 ether);
-        vm.expectRevert("OTCTrading: incorrect ETH amount");
-        otc.createOrder{value: ethAmount + 1 ether}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
-        vm.stopPrank();
-    }
-
-    function test_FillSellOrderWithETHInsufficientAmount() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        // Create SELL order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(0), baseAmount, ethAmount);
-        vm.stopPrank();
-
-        // Try to fill with insufficient ETH
-        uint256 fillAmount = 500 * 10 ** baseToken.decimals();
-        uint256 expectedEthAmount = (fillAmount * ethAmount) / baseAmount;
-        uint256 takerFee = (expectedEthAmount * otc.takerFeeBps()) / 10000;
-
-        vm.startPrank(user2);
-        vm.deal(user2, 10 ether);
-        vm.expectRevert("OTCTrading: insufficient ETH sent");
-        otc.fillOrder{value: expectedEthAmount + takerFee - 1 wei}(orderId, fillAmount);
-        vm.stopPrank();
-    }
-
-    // ============ BUY Order with ERC20 Tests ============
-
-    function test_CreateBuyOrderWithERC20() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-        // BUY makers pre-fund the maker fee (Variant A).
-        uint256 makerFeeDeposit = (usdcAmount * otc.makerFeeBps()) / 10000;
-
-        vm.startPrank(user1);
-        usdc.approve(address(otc), usdcAmount + makerFeeDeposit);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        assertEq(orderId, 1);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertEq(order.maker, user1);
-        assertEq(uint256(order.orderType), uint256(OTCTrading.OrderType.BUY));
-        assertEq(order.counterpartyToken, address(usdc));
-        assertEq(order.baseTokenAmount, baseAmount);
-        assertEq(order.counterpartyTokenAmount, usdcAmount);
-        assertTrue(order.isActive);
-    }
-
-    function test_FillBuyOrderWithERC20() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create BUY order (user1 buys base tokens with USDC); maker pre-funds maker fee.
-        uint256 makerFeeDeposit = (usdcAmount * otc.makerFeeBps()) / 10000;
-        vm.startPrank(user1);
-        usdc.approve(address(otc), usdcAmount + makerFeeDeposit);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fill order (user2 sells base tokens for USDC)
-        uint256 fillAmount = 500 * 10 ** baseToken.decimals();
-        uint256 expectedUsdcAmount = (fillAmount * usdcAmount) / baseAmount;
-        uint256 makerFee = (expectedUsdcAmount * otc.makerFeeBps()) / 10000;
-        uint256 takerFee = (expectedUsdcAmount * otc.takerFeeBps()) / 10000;
-
-        uint256 user1BaseBefore = baseToken.balanceOf(user1);
-        uint256 user2UsdcBefore = usdc.balanceOf(user2);
-        uint256 feeRecipientUsdcBefore = usdc.balanceOf(feeRecipient);
-
-        vm.startPrank(user2);
-        baseToken.approve(address(otc), fillAmount);
-        otc.fillOrder(orderId, fillAmount);
-        vm.stopPrank();
-
-        // Check balances
-        assertEq(baseToken.balanceOf(user1), user1BaseBefore + fillAmount);
-        // Variant A: maker fee was pre-funded; taker (seller) only bears the taker fee.
-        assertEq(usdc.balanceOf(user2), user2UsdcBefore + expectedUsdcAmount - takerFee);
-        assertEq(usdc.balanceOf(feeRecipient), feeRecipientUsdcBefore + makerFee + takerFee);
-    }
-
-    function test_CancelBuyOrderWithERC20() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create BUY order (maker pre-funds maker fee)
-        uint256 makerFeeDeposit = (usdcAmount * otc.makerFeeBps()) / 10000;
-        vm.startPrank(user1);
-        uint256 usdcBefore = usdc.balanceOf(user1);
-        usdc.approve(address(otc), usdcAmount + makerFeeDeposit);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-
-        // Check that the full deposit (amount + maker fee) was returned
-        assertEq(usdc.balanceOf(user1), usdcBefore);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-    }
-
-    // ============ FillOrder Edge Cases ============
-
-    function test_FillOwnOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.expectRevert("OTCTrading: cannot fill own order");
-        otc.fillOrder(orderId, baseAmount / 2);
-        vm.stopPrank();
-    }
-
-    function test_FillCancelledOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount);
-        vm.expectRevert("OTCTrading: order not active");
-        otc.fillOrder(orderId, baseAmount / 2);
-        vm.stopPrank();
-    }
-
-    function test_FillFullyFilledOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fill completely
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + (usdcAmount * otc.takerFeeBps()) / 10000);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Try to fill again
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount);
-        vm.expectRevert("OTCTrading: order not active");
-        otc.fillOrder(orderId, 1);
-        vm.stopPrank();
-    }
-
-    function test_FillExceedsOrderSize() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount * 2);
-        vm.expectRevert("OTCTrading: exceeds order size");
-        otc.fillOrder(orderId, baseAmount + 1);
-        vm.stopPrank();
-    }
-
-    function test_FullFillOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fill completely
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Check order is inactive
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-        assertEq(order.filledAmount, baseAmount);
-    }
-
-    function test_MultiplePartialFills() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // First partial fill
-        uint256 fillAmount1 = 300 * 10 ** baseToken.decimals();
-        uint256 expectedUsdc1 = (fillAmount1 * usdcAmount) / baseAmount;
-        uint256 takerFee1 = (expectedUsdc1 * otc.takerFeeBps()) / 10000;
-
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount * 2);
-        otc.fillOrder(orderId, fillAmount1);
-        vm.stopPrank();
-
-        // Second partial fill
-        uint256 fillAmount2 = 400 * 10 ** baseToken.decimals();
-        uint256 expectedUsdc2 = (fillAmount2 * usdcAmount) / baseAmount;
-        uint256 takerFee2 = (expectedUsdc2 * otc.takerFeeBps()) / 10000;
-
-        vm.startPrank(user2);
-        otc.fillOrder(orderId, fillAmount2);
-        vm.stopPrank();
-
-        // Check order state
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertEq(order.filledAmount, fillAmount1 + fillAmount2);
-        assertTrue(order.isActive);
-
-        // Third fill to complete
-        uint256 fillAmount3 = baseAmount - fillAmount1 - fillAmount2;
-        vm.startPrank(user2);
-        otc.fillOrder(orderId, fillAmount3);
-        vm.stopPrank();
-
-        // Check order is now inactive
-        order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-        assertEq(order.filledAmount, baseAmount);
-    }
-
-    function test_FillOrderWhenPaused() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Pause
-        vm.prank(admin);
-        otc.pause();
-
-        // Try to fill
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount);
-        vm.expectRevert();
-        otc.fillOrder(orderId, baseAmount / 2);
-        vm.stopPrank();
-    }
-
-    // ============ CancelOrder Edge Cases ============
-
-    function test_CancelSomeoneElsesOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        vm.expectRevert("OTCTrading: not order maker");
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-    }
-
-    function test_CancelAlreadyCancelledOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        otc.cancelOrder(orderId);
-        vm.expectRevert("OTCTrading: order not active");
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-    }
-
-    function test_CancelFullyFilledOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fill completely
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Try to cancel (order is inactive, so it fails at isActive check)
-        vm.startPrank(user1);
-        vm.expectRevert("OTCTrading: order not active");
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-    }
-
-    // ============ View Functions ============
-
-    function test_GetUserOrders() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        uint256[] memory orders = otc.getUserOrders(user1);
-        assertEq(orders.length, 3);
-        assertEq(orders[0], orderId1);
-        assertEq(orders[1], orderId2);
-        assertEq(orders[2], orderId3);
-    }
-
-    function test_GetRemainingAmount() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Check initial remaining amount
-        assertEq(otc.getRemainingAmount(orderId), baseAmount);
-
-        // Partial fill
-        uint256 fillAmount = 300 * 10 ** baseToken.decimals();
-        uint256 expectedUsdc = (fillAmount * usdcAmount) / baseAmount;
-        uint256 takerFee = (expectedUsdc * otc.takerFeeBps()) / 10000;
-
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount * 2);
-        otc.fillOrder(orderId, fillAmount);
-        vm.stopPrank();
-
-        // Check remaining amount
-        assertEq(otc.getRemainingAmount(orderId), baseAmount - fillAmount);
-
-        // Fill completely
-        uint256 remaining = baseAmount - fillAmount;
-        uint256 expectedUsdc2 = (remaining * usdcAmount) / baseAmount;
-        uint256 takerFee2 = (expectedUsdc2 * otc.takerFeeBps()) / 10000;
-
-        vm.startPrank(user2);
-        otc.fillOrder(orderId, remaining);
-        vm.stopPrank();
-
-        // Check remaining amount is 0
-        assertEq(otc.getRemainingAmount(orderId), 0);
-    }
-
-    function test_GetRemainingAmountCancelledOrder() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        otc.cancelOrder(orderId);
-        vm.stopPrank();
-
-        // Cancelled order should return 0
-        assertEq(otc.getRemainingAmount(orderId), 0);
-    }
-
-    // ============ Admin Functions (Missing) ============
-
-    function test_RemoveCounterpartyToken() public {
-        // Remove USDC
-        vm.prank(admin);
-        otc.removeCounterpartyToken(address(usdc));
-        assertFalse(otc.allowedCounterpartyTokens(address(usdc)));
-
-        // Try to create order with removed token (should fail)
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: counterparty token not allowed");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_RemoveFromWhitelist() public {
-        // Remove user1 from whitelist
-        vm.prank(admin);
-        otc.removeFromWhitelist(user1);
-        assertFalse(otc.whitelist(user1));
-
-        // Try to create order (should fail)
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: not whitelisted");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_UpdateFeeRecipient() public {
-        address newFeeRecipient = address(0x999);
-        vm.prank(admin);
-        otc.updateFeeRecipient(newFeeRecipient);
-        assertEq(otc.feeRecipient(), newFeeRecipient);
-    }
-
-    function test_UpdateFeesTooHigh() public {
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: maker fee too high");
-        otc.updateFees(1001, 50); // Maker fee > 10%
-
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: taker fee too high");
-        otc.updateFees(25, 1001); // Taker fee > 10%
-    }
-
-    function test_UpdateMinOrderSizeZero() public {
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: invalid min order size");
-        otc.updateMinOrderSize(0);
-    }
-
-    // ============ Other Edge Cases ============
-
-    function test_CreateOrderInvalidCounterpartyToken() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        MockERC20 invalidToken = new MockERC20("Invalid", "INV");
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: counterparty token not allowed");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(invalidToken), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_CreateOrderZeroCounterpartyAmount() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: invalid counterparty amount");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, 0);
-        vm.stopPrank();
-    }
-
-    function test_FillOrderZeroAmount() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        vm.expectRevert("OTCTrading: invalid fill amount");
-        otc.fillOrder(orderId, 0);
-        vm.stopPrank();
-    }
-
-    function test_OrderBecomesInactiveWhenFullyFilled() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Order should be active initially
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertTrue(order.isActive);
-
-        // Fill completely
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Order should be inactive
-        order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-        assertEq(order.filledAmount, baseAmount);
-    }
-
-    function test_NextOrderIdIncrements() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        assertEq(orderId1, 1);
-        assertEq(orderId2, 2);
-        assertEq(orderId3, 3);
-    }
-
-    function test_FillOrderNotWhitelisted() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Remove user2 from whitelist
-        vm.prank(admin);
-        otc.removeFromWhitelist(user2);
-
-        // Try to fill (should fail)
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount);
-        vm.expectRevert("OTCTrading: not whitelisted");
-        otc.fillOrder(orderId, baseAmount / 2);
-        vm.stopPrank();
-    }
-
-    // ============ New Feature Tests ============
-
-    function test_UpdateMaxOrderSize() public {
-        // Set max order size (in base token units, not decimals)
-        vm.prank(admin);
-        otc.updateMaxOrderSize(5000);
-        assertEq(otc.maxOrderSize(), 5000);
-
-        // Try to create order above max (should fail)
-        uint256 baseAmount = 6000; // Above max (5000)
-        uint256 usdcAmount = 12000;
-
-        vm.startPrank(user1);
-        baseToken.mint(user1, baseAmount);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: order size above maximum");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Try to create order within max (should work)
-        baseAmount = 4000; // Within max (5000)
-        usdcAmount = 8000;
-
-        vm.startPrank(user1);
-        baseToken.mint(user1, baseAmount);
-        baseToken.approve(address(otc), baseAmount);
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Remove max (set to 0)
-        vm.prank(admin);
-        otc.updateMaxOrderSize(0);
-        assertEq(otc.maxOrderSize(), 0);
-    }
-
-    function test_UpdateMaxOrderSizeBelowMin() public {
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: max below min");
-        otc.updateMaxOrderSize(50); // Below minOrderSize (100)
-    }
-
-    function test_UpdateDefaultOrderExpiration() public {
-        // Set expiration to 1 day
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 days);
-        assertEq(otc.defaultOrderExpiration(), 1 days);
-
-        // Create order - should have expiration
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertEq(order.expiresAt, block.timestamp + 1 days);
-
-        // Remove expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-        assertEq(otc.defaultOrderExpiration(), 0);
-    }
-
-    function test_BatchAddToWhitelist() public {
-        address user3 = address(0x3);
-        address user4 = address(0x4);
-        address user5 = address(0x5);
-
-        address[] memory accounts = new address[](3);
-        accounts[0] = user3;
-        accounts[1] = user4;
-        accounts[2] = user5;
-
-        vm.prank(admin);
-        otc.batchAddToWhitelist(accounts);
-
-        assertTrue(otc.whitelist(user3));
-        assertTrue(otc.whitelist(user4));
-        assertTrue(otc.whitelist(user5));
-    }
-
-    function test_BatchAddToWhitelistWithInvalidAddress() public {
-        address user3 = address(0x3);
-        address user4 = address(0);
-
-        address[] memory accounts = new address[](2);
-        accounts[0] = user3;
-        accounts[1] = user4;
-
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: invalid account");
-        otc.batchAddToWhitelist(accounts);
-    }
-
-    function test_BatchRemoveFromWhitelist() public {
-        address user3 = address(0x3);
-        address user4 = address(0x4);
-
-        // Add them first
-        vm.prank(admin);
-        otc.addToWhitelist(user3);
-        vm.prank(admin);
-        otc.addToWhitelist(user4);
-
-        address[] memory accounts = new address[](2);
-        accounts[0] = user3;
-        accounts[1] = user4;
-
-        vm.prank(admin);
-        otc.batchRemoveFromWhitelist(accounts);
-
-        assertFalse(otc.whitelist(user3));
-        assertFalse(otc.whitelist(user4));
-    }
-
-    function test_BatchCancelOrders() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        uint256 balanceBefore = baseToken.balanceOf(user1);
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        uint256 balanceAfterCreate = baseToken.balanceOf(user1);
-        assertEq(balanceAfterCreate, balanceBefore - (baseAmount * 3));
-
-        uint256[] memory orderIds = new uint256[](3);
-        orderIds[0] = orderId1;
-        orderIds[1] = orderId2;
-        orderIds[2] = orderId3;
-
-        vm.startPrank(user1);
-        otc.batchCancelOrders(orderIds);
-        vm.stopPrank();
-
-        // Check all orders are cancelled
-        assertFalse(otc.getOrder(orderId1).isActive);
-        assertFalse(otc.getOrder(orderId2).isActive);
-        assertFalse(otc.getOrder(orderId3).isActive);
-
-        // Check tokens were returned
-        assertEq(baseToken.balanceOf(user1), balanceBefore);
-    }
-
-    function test_CleanupExpiredOrders() public {
-        // Set expiration to 1 hour
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 hours);
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create orders
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 2);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        vm.startPrank(user2);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fast forward time
-        vm.warp(block.timestamp + 2 hours);
-
-        // Cleanup expired orders
-        uint256[] memory orderIds = new uint256[](2);
-        orderIds[0] = orderId1;
-        orderIds[1] = orderId2;
-
-        uint256 user1BalanceBefore = baseToken.balanceOf(user1);
-        uint256 user2BalanceBefore = baseToken.balanceOf(user2);
-
-        vm.prank(admin);
-        uint256 cleaned = otc.cleanupExpiredOrders(orderIds);
-
-        assertEq(cleaned, 2);
-        assertFalse(otc.getOrder(orderId1).isActive);
-        assertFalse(otc.getOrder(orderId2).isActive);
-
-        // Check tokens were returned
-        assertEq(baseToken.balanceOf(user1), user1BalanceBefore + baseAmount);
-        assertEq(baseToken.balanceOf(user2), user2BalanceBefore + baseAmount);
-
-        // Reset expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-    }
-
-    function test_CleanupExpiredOrdersWithETH() public {
-        // Add ETH as counterparty token
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(0));
-
-        // Set expiration to 1 hour
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 hours);
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 ethAmount = 2 ether;
-
-        // Create BUY order with ETH (maker pre-funds maker fee)
-        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
-        vm.startPrank(user1);
-        vm.deal(user1, 10 ether);
-        uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount + makerFeeDeposit}(
-            OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount
-        );
-        vm.stopPrank();
-
-        // Fast forward time
-        vm.warp(block.timestamp + 2 hours);
-
-        // Cleanup expired order
-        uint256[] memory orderIds = new uint256[](1);
-        orderIds[0] = orderId;
-
-        vm.prank(admin);
-        uint256 cleaned = otc.cleanupExpiredOrders(orderIds);
-
-        assertEq(cleaned, 1);
-        assertFalse(otc.getOrder(orderId).isActive);
-        assertEq(user1.balance, user1BalanceBefore); // full deposit (amount + maker fee) returned
-
-        // Reset expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-    }
-
-    function test_EmergencyWithdrawERC20() public {
-        // Send some tokens to contract (simulate stuck tokens)
-        uint256 stuckAmount = 1000 * 10 ** baseToken.decimals();
-        vm.startPrank(user1);
-        baseToken.transfer(address(otc), stuckAmount);
-        vm.stopPrank();
-
-        address recipient = address(0x999);
-        uint256 recipientBalanceBefore = baseToken.balanceOf(recipient);
-
-        vm.prank(admin);
-        otc.pause(); // emergencyWithdraw is only callable while paused
-        vm.prank(admin);
-        otc.emergencyWithdraw(address(baseToken), recipient, 0); // 0 = withdraw all
-
-        assertEq(baseToken.balanceOf(recipient), recipientBalanceBefore + stuckAmount);
-    }
-
-    function test_EmergencyWithdrawETH() public {
-        // Send ETH to contract
-        vm.deal(address(otc), 5 ether);
-
-        address recipient = address(0x999);
-        uint256 recipientBalanceBefore = recipient.balance;
-
-        vm.prank(admin);
-        otc.pause(); // emergencyWithdraw is only callable while paused
-        vm.prank(admin);
-        otc.emergencyWithdraw(address(0), recipient, 0); // 0 = withdraw all
-
-        assertEq(recipient.balance, recipientBalanceBefore + 5 ether);
-    }
-
-    function test_EmergencyWithdrawPartialAmount() public {
-        uint256 stuckAmount = 1000 * 10 ** baseToken.decimals();
-        vm.startPrank(user1);
-        baseToken.transfer(address(otc), stuckAmount);
-        vm.stopPrank();
-
-        address recipient = address(0x999);
-        uint256 withdrawAmount = 500 * 10 ** baseToken.decimals();
-
-        vm.prank(admin);
-        otc.pause(); // emergencyWithdraw is only callable while paused
-        vm.prank(admin);
-        otc.emergencyWithdraw(address(baseToken), recipient, withdrawAmount);
-
-        assertEq(baseToken.balanceOf(recipient), withdrawAmount);
-        assertEq(baseToken.balanceOf(address(otc)), stuckAmount - withdrawAmount);
-    }
-
-    function test_EmergencyWithdrawNotAdmin() public {
-        vm.startPrank(user1);
-        vm.expectRevert();
-        otc.emergencyWithdraw(address(baseToken), address(0x999), 0);
-        vm.stopPrank();
-    }
-
-    function test_GetActiveOrders() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create multiple orders
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fill one order
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(orderId2, baseAmount);
-        vm.stopPrank();
-
-        // Get active orders
-        (uint256[] memory orderIds, uint256 total) = otc.getActiveOrders(0, 10);
-
-        assertEq(total, 2); // Only orderId1 and orderId3 should be active
-        assertEq(orderIds.length, 2);
-        // Should contain orderId1 and orderId3 (not orderId2 as it's filled)
-    }
-
-    function test_GetOrdersByToken() public {
-        MockERC20 newToken = new MockERC20("New Token", "NEW");
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(newToken));
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-        uint256 newTokenAmount = 3000 * 10 ** newToken.decimals();
-
-        // Create orders with different tokens
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(newToken), baseAmount, newTokenAmount);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Get orders by USDC token
-        uint256[] memory usdcOrders = otc.getOrdersByToken(address(usdc), 0, 10);
-        assertEq(usdcOrders.length, 2);
-        assertTrue(usdcOrders[0] == orderId1 || usdcOrders[0] == orderId3);
-        assertTrue(usdcOrders[1] == orderId1 || usdcOrders[1] == orderId3);
-
-        // Get orders by newToken
-        uint256[] memory newTokenOrders = otc.getOrdersByToken(address(newToken), 0, 10);
-        assertEq(newTokenOrders.length, 1);
-        // Note: orderId2 should be in newTokenOrders, but order IDs might vary
-    }
-
-    function test_IsOrderExpired() public {
-        // Set expiration to 1 hour
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 hours);
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Should not be expired initially
-        assertFalse(otc.isOrderExpired(orderId));
-
-        // Fast forward time
-        vm.warp(block.timestamp + 2 hours);
-
-        // Should be expired
-        assertTrue(otc.isOrderExpired(orderId));
-
-        // Reset expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-    }
-
-    function test_FillExpiredOrder() public {
-        // Set expiration to 1 hour
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 hours);
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fast forward time
-        vm.warp(block.timestamp + 2 hours);
-
-        // Try to fill expired order (should fail)
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        vm.expectRevert("OTCTrading: order expired");
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Reset expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-    }
-
-    function test_GetRemainingAmountExpiredOrder() public {
-        // Set expiration to 1 hour
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 hours);
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fast forward time
-        vm.warp(block.timestamp + 2 hours);
-
-        // Remaining amount should be 0 for expired order
-        assertEq(otc.getRemainingAmount(orderId), 0);
-
-        // Reset expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-    }
-
-    function test_CreateOrderPriceTooLow() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 1; // Extremely low price
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: price too low");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_CreateOrderPriceTooHigh() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals(); // Valid amount (above min)
-        // Price ratio: usdcAmount * 1e18 / baseAmount should exceed 1e36
-        // So: usdcAmount * 1e18 > 1e36 * baseAmount
-        // usdcAmount > 1e18 * baseAmount
-        // For baseAmount = 1000 * 1e18, usdcAmount > 1e39
-        uint256 usdcAmount = 2e39; // Price ratio would be 2e39 * 1e18 / (1000 * 1e18) = 2e36 > 1e36
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: price too high");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function test_CreateOrderAboveMaxOrderSize() public {
-        // Set max order size
-        vm.prank(admin);
-        otc.updateMaxOrderSize(5000);
-
-        uint256 baseAmount = 6000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 12000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        vm.expectRevert("OTCTrading: order size above maximum");
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Reset max order size
-        vm.prank(admin);
-        otc.updateMaxOrderSize(0);
-    }
-
-    // ============ Additional Edge Cases ============
-
-    function test_CancelOrderWhenPaused() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create order
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Pause contract
-        vm.prank(admin);
-        otc.pause();
-
-        // Cancel order should still work (cancelOrder doesn't have whenNotPaused)
-        uint256 balanceBefore = baseToken.balanceOf(user1);
+    function test_CreateSell_RevertsWithoutApproval() public {
         vm.prank(user1);
-        otc.cancelOrder(orderId);
-
-        // Check that tokens were returned
-        assertEq(baseToken.balanceOf(user1), balanceBefore + baseAmount);
-        OTCTrading.Order memory order = otc.getOrder(orderId);
-        assertFalse(order.isActive);
-
-        // Unpause
-        vm.prank(admin);
-        otc.unpause();
+        vm.expectRevert("OTCTrading: approve first");
+        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
     }
 
-    function test_GetActiveOrdersInvalidLimitZero() public {
-        vm.expectRevert("OTCTrading: invalid limit");
-        otc.getActiveOrders(0, 0);
-    }
-
-    function test_GetActiveOrdersInvalidLimitTooHigh() public {
-        vm.expectRevert("OTCTrading: invalid limit");
-        otc.getActiveOrders(0, 101);
-    }
-
-    function test_GetActiveOrdersOffsetBeyondTotal() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create 2 orders
+    function test_CreateBuy_RequiresCounterpartyPlusMakerFee() public {
+        uint256 makerFee = (2000e18 * MAKER_BPS) / 10000; // 5e18
         vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 2);
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
+        usdc.approve(address(otc), 2000e18); // not enough (missing maker fee)
+        vm.expectRevert("OTCTrading: approve first");
+        otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), 1000e18, 2000e18);
+
+        usdc.approve(address(otc), 2000e18 + makerFee);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), 1000e18, 2000e18);
         vm.stopPrank();
-
-        // Try offset beyond total (should return empty array)
-        (uint256[] memory orderIds, uint256 total) = otc.getActiveOrders(100, 10);
-        assertEq(total, 2);
-        assertEq(orderIds.length, 0);
+        assertEq(usdc.balanceOf(user1), 100_000e18, "no escrow on BUY create");
+        assertTrue(otc.getOrder(id).isActive);
     }
 
-    function test_GetOrdersByTokenInvalidLimitZero() public {
-        vm.expectRevert("OTCTrading: invalid limit");
-        otc.getOrdersByToken(address(usdc), 0, 0);
-    }
+    // ---------- fillOrder: fee symmetry ----------
 
-    function test_GetOrdersByTokenInvalidLimitTooHigh() public {
-        vm.expectRevert("OTCTrading: invalid limit");
-        otc.getOrdersByToken(address(usdc), 0, 101);
-    }
-
-    function test_GetOrdersByTokenOffsetBeyondTotal() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create 2 orders with USDC
+    function test_FillSell_FeeSymmetry() public {
         vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 2);
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
         vm.stopPrank();
 
-        // Try offset beyond total (should return empty array)
-        uint256[] memory orderIds = otc.getOrdersByToken(address(usdc), 100, 10);
-        assertEq(orderIds.length, 0);
-    }
+        uint256 fill = 500e18;
+        uint256 settlement = 1000e18;
+        uint256 makerFee = (settlement * MAKER_BPS) / 10000; // 2.5e18
+        uint256 takerFee = (settlement * TAKER_BPS) / 10000; // 5e18
 
-    function test_BatchCancelOrdersEmptyArray() public {
-        // Should not revert, just do nothing
-        uint256[] memory orderIds = new uint256[](0);
-        vm.prank(user1);
-        otc.batchCancelOrders(orderIds);
-    }
-
-    function test_BatchCancelOrdersMixedOrders() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create orders by user1
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Create order by user2
-        vm.startPrank(user2);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Cancel orderId2 manually
-        vm.prank(user1);
-        otc.cancelOrder(orderId2);
-
-        uint256 balanceBefore = baseToken.balanceOf(user1);
-
-        // Try to batch cancel: own order (orderId1), someone else's order (orderId3), already cancelled (orderId2)
-        uint256[] memory orderIds = new uint256[](3);
-        orderIds[0] = orderId1;
-        orderIds[1] = orderId3; // user2's order
-        orderIds[2] = orderId2; // already cancelled
-
-        vm.prank(user1);
-        otc.batchCancelOrders(orderIds);
-
-        // Only orderId1 should be cancelled
-        assertFalse(otc.getOrder(orderId1).isActive);
-        assertTrue(otc.getOrder(orderId3).isActive); // user2's order should still be active
-        assertFalse(otc.getOrder(orderId2).isActive); // was already cancelled
-
-        // Check tokens were returned for orderId1
-        assertEq(baseToken.balanceOf(user1), balanceBefore + baseAmount);
-    }
-
-    function test_CleanupExpiredOrdersEmptyArray() public {
-        // Should not revert, just return 0
-        uint256[] memory orderIds = new uint256[](0);
-        vm.prank(admin);
-        uint256 cleaned = otc.cleanupExpiredOrders(orderIds);
-        assertEq(cleaned, 0);
-    }
-
-    function test_CleanupExpiredOrdersMixedOrders() public {
-        // Set expiration to 1 hour
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(1 hours);
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Create orderId1
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount * 3);
-        uint256 orderId1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Create orderId3
-        vm.startPrank(user1);
-        uint256 orderId3 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Fast forward time to expire orderId1 and orderId3 (they expire at T+1 hour)
-        vm.warp(block.timestamp + 2 hours);
-
-        // Create active order (not expired) - created at T+2 hours, expires at T+3 hours
-        vm.startPrank(user2);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Don't warp forward - orderId2 should still be active (expires at T+3 hours, current time is T+2 hours)
-
-        uint256 user1BalanceBefore = baseToken.balanceOf(user1);
-        uint256 user2BalanceBefore = baseToken.balanceOf(user2);
-
-        // Cleanup: expired (orderId1), not expired (orderId2), expired (orderId3)
-        uint256[] memory orderIds = new uint256[](3);
-        orderIds[0] = orderId1; // expired
-        orderIds[1] = orderId2; // not expired
-        orderIds[2] = orderId3; // expired
-
-        vm.prank(admin);
-        uint256 cleaned = otc.cleanupExpiredOrders(orderIds);
-
-        // Only 2 expired orders should be cleaned
-        assertEq(cleaned, 2);
-        assertFalse(otc.getOrder(orderId1).isActive); // expired, cleaned
-        assertTrue(otc.getOrder(orderId2).isActive); // not expired, still active
-        assertFalse(otc.getOrder(orderId3).isActive); // expired, cleaned
-
-        // Check tokens were returned for expired orders only
-        assertEq(baseToken.balanceOf(user1), user1BalanceBefore + (baseAmount * 2)); // orderId1 and orderId3
-        assertEq(baseToken.balanceOf(user2), user2BalanceBefore); // orderId2 not cleaned
-
-        // Reset expiration
-        vm.prank(admin);
-        otc.updateDefaultOrderExpiration(0);
-    }
-
-    function test_EmergencyWithdrawExceedsBalance() public {
-        uint256 stuckAmount = 1000 * 10 ** baseToken.decimals();
-
-        // Send some tokens to contract
-        vm.startPrank(user1);
-        baseToken.transfer(address(otc), stuckAmount);
-        vm.stopPrank();
-
-        address recipient = address(0x999);
-        uint256 withdrawAmount = stuckAmount + 1; // More than balance
-
-        vm.prank(admin);
-        otc.pause(); // emergencyWithdraw is only callable while paused
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: insufficient balance");
-        otc.emergencyWithdraw(address(baseToken), recipient, withdrawAmount);
-    }
-
-    function test_EmergencyWithdrawETHExceedsBalance() public {
-        vm.deal(address(otc), 5 ether);
-
-        address recipient = address(0x999);
-        uint256 withdrawAmount = 6 ether; // More than balance
-
-        vm.prank(admin);
-        otc.pause(); // emergencyWithdraw is only callable while paused
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: insufficient balance");
-        otc.emergencyWithdraw(address(0), recipient, withdrawAmount);
-    }
-
-    function test_UpdateMinOrderSizeExceedsMax() public {
-        // Set max order size first
-        vm.prank(admin);
-        otc.updateMaxOrderSize(5000);
-
-        // Try to set min order size above max (should fail)
-        vm.prank(admin);
-        vm.expectRevert("OTCTrading: min exceeds max");
-        otc.updateMinOrderSize(6000); // Above maxOrderSize (5000)
-
-        // Reset max order size
-        vm.prank(admin);
-        otc.updateMaxOrderSize(0);
-    }
-
-    // ============ Additional Edge Cases ============
-
-    function test_UpdateWhitelistRequirementDisabled() public {
-        address nonWhitelisted = address(0x999);
-        usdc.mint(nonWhitelisted, 10000 * 10 ** usdc.decimals());
-        baseToken.mint(nonWhitelisted, 10000 * 10 ** baseToken.decimals());
-
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        // Disable whitelist requirement
-        vm.prank(admin);
-        otc.updateWhitelistRequirement(false);
-        assertFalse(otc.requireWhitelist());
-
-        // Non-whitelisted user should be able to create order
-        vm.startPrank(nonWhitelisted);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Non-whitelisted user should be able to fill order (from another non-whitelisted user)
-        address filler = address(0x888);
-        usdc.mint(filler, 10000 * 10 ** usdc.decimals());
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-
-        vm.startPrank(filler);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Re-enable whitelist requirement
-        vm.prank(admin);
-        otc.updateWhitelistRequirement(true);
-    }
-
-    function test_UpdateWhitelistRequirementToggle() public {
-        // Initially whitelist is required (from setUp)
-        assertTrue(otc.requireWhitelist());
-
-        // Toggle to false
-        vm.prank(admin);
-        otc.updateWhitelistRequirement(false);
-        assertFalse(otc.requireWhitelist());
-
-        // Toggle back to true
-        vm.prank(admin);
-        otc.updateWhitelistRequirement(true);
-        assertTrue(otc.requireWhitelist());
-    }
-
-    function test_UpdateFeesZero() public {
-        // Set fees to zero
-        vm.prank(admin);
-        otc.updateFees(0, 0);
-        assertEq(otc.makerFeeBps(), 0);
-        assertEq(otc.takerFeeBps(), 0);
-
-        // Create and fill order with zero fees
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        uint256 feeRecipientBalanceBefore = usdc.balanceOf(feeRecipient);
-        uint256 user1BalanceBefore = usdc.balanceOf(user1);
+        uint256 makerUsdc0 = usdc.balanceOf(user1);
+        uint256 takerUsdc0 = usdc.balanceOf(user2);
 
         vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Check no fees were collected
-        assertEq(usdc.balanceOf(feeRecipient), feeRecipientBalanceBefore);
-        assertEq(usdc.balanceOf(user1), user1BalanceBefore + usdcAmount);
-
-        // Reset fees to default
-        vm.prank(admin);
-        otc.updateFees(25, 50);
-    }
-
-    function test_UpdateFeesMax() public {
-        // Set fees to maximum (1000 bps = 10%)
-        vm.prank(admin);
-        otc.updateFees(1000, 1000);
-        assertEq(otc.makerFeeBps(), 1000);
-        assertEq(otc.takerFeeBps(), 1000);
-
-        // Create and fill order with max fees
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
-        vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 orderId = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        uint256 makerFee = (usdcAmount * 1000) / 10000; // 10%
-        uint256 takerFee = (usdcAmount * 1000) / 10000; // 10%
-        uint256 feeRecipientBalanceBefore = usdc.balanceOf(feeRecipient);
-        uint256 user1BalanceBefore = usdc.balanceOf(user1);
-
-        vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(orderId, baseAmount);
-        vm.stopPrank();
-
-        // Check fees were collected
-        assertEq(usdc.balanceOf(feeRecipient), feeRecipientBalanceBefore + makerFee + takerFee);
-        assertEq(usdc.balanceOf(user1), user1BalanceBefore + usdcAmount - makerFee);
-
-        // Reset fees to default
-        vm.prank(admin);
-        otc.updateFees(25, 50);
-    }
-
-    function test_GetOrderNonExistent() public {
-        // Get order with non-existent order ID
-        OTCTrading.Order memory order = otc.getOrder(99999);
-
-        // Should return default Order struct
-        assertEq(order.id, 0);
-        assertEq(order.maker, address(0));
-        assertEq(uint256(order.orderType), 0); // BUY = 0
-        assertEq(order.counterpartyToken, address(0));
-        assertEq(order.baseTokenAmount, 0);
-        assertEq(order.counterpartyTokenAmount, 0);
-        assertEq(order.filledAmount, 0);
-        assertFalse(order.isActive);
-        assertEq(order.createdAt, 0);
-        assertEq(order.expiresAt, 0);
-    }
-
-    function test_GetOrdersByTokenNoOrders() public {
-        MockERC20 newToken = new MockERC20("New Token", "NEW");
-        vm.prank(admin);
-        otc.addCounterpartyToken(address(newToken));
-
-        // Get orders for token with no orders
-        uint256[] memory orderIds = otc.getOrdersByToken(address(newToken), 0, 10);
-        assertEq(orderIds.length, 0);
-    }
-
-    function test_GetActiveOrdersNoOrders() public {
-        // Get active orders when there are no orders
-        (uint256[] memory orderIds, uint256 total) = otc.getActiveOrders(0, 10);
-        assertEq(total, 0);
-        assertEq(orderIds.length, 0);
-    }
-
-    // ============ Security regression tests ============
-
-    /// Fully filling a BUY order must not disburse more counterparty token than
-    /// the maker deposited. Regression for the fee-accounting insolvency bug.
-    function test_Security_BuyOrderStaysSolvent() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-        uint256 makerFee = (usdcAmount * otc.makerFeeBps()) / 10000;
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-
-        // Variant A: maker deposits the amount PLUS the pre-funded maker fee.
-        vm.startPrank(user1);
-        uint256 user2StartUsdc = usdc.balanceOf(user2);
-        usdc.approve(address(otc), usdcAmount + makerFee);
-        uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        assertEq(usdc.balanceOf(address(otc)), usdcAmount + makerFee);
-
-        // Taker fully fills.
-        vm.startPrank(user2);
-        baseToken.approve(address(otc), baseAmount);
-        otc.fillOrder(id, baseAmount);
-        vm.stopPrank();
-
-        // The order's entire deposit is consumed and nothing more: the contract's
-        // USDC balance returns to its pre-order level (zero here).
-        assertEq(usdc.balanceOf(address(otc)), 0, "BUY fill overspent the deposit");
-
-        // Taker (seller) bears only the taker fee; maker fee was pre-funded.
-        assertEq(usdc.balanceOf(user2), user2StartUsdc + usdcAmount - takerFee);
-        assertEq(usdc.balanceOf(feeRecipient), makerFee + takerFee);
-    }
-
-    /// Variant A: after a partial fill, cancelling a BUY order refunds the unused
-    /// settlement AND the unused pre-funded maker fee, leaving the contract solvent.
-    function test_Security_BuyOrderPartialFillThenCancelRefundsMakerFee() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-        uint256 makerFee = (usdcAmount * otc.makerFeeBps()) / 10000; // full-order maker fee
-
-        // Maker deposits amount + maker fee.
-        vm.startPrank(user1);
-        uint256 makerUsdcStart = usdc.balanceOf(user1);
-        usdc.approve(address(otc), usdcAmount + makerFee);
-        uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
-        vm.stopPrank();
-
-        // Taker fills 40% (400 base).
-        uint256 fill = 400 * 10 ** baseToken.decimals();
-        uint256 settlement = (fill * usdcAmount) / baseAmount; // 800
-        uint256 fillMakerFee = (settlement * otc.makerFeeBps()) / 10000; // 2
-        uint256 fillTakerFee = (settlement * otc.takerFeeBps()) / 10000; // 4
-        vm.startPrank(user2);
-        uint256 takerUsdcStart = usdc.balanceOf(user2);
-        baseToken.approve(address(otc), fill);
+        usdc.approve(address(otc), settlement + takerFee);
         otc.fillOrder(id, fill);
         vm.stopPrank();
 
-        // Maker cancels the remaining 60%.
+        // base moved maker -> taker
+        assertEq(base.balanceOf(user2), 100_000e18 + fill);
+        assertEq(base.balanceOf(user1), 100_000e18 - fill);
+        // maker receives settlement - makerFee; taker pays settlement + takerFee
+        assertEq(usdc.balanceOf(user1), makerUsdc0 + settlement - makerFee);
+        assertEq(usdc.balanceOf(user2), takerUsdc0 - (settlement + takerFee));
+        assertEq(usdc.balanceOf(feeRecipient), makerFee + takerFee);
+        // core is non-custodial: holds nothing
+        assertEq(base.balanceOf(address(otc)), 0);
+        assertEq(usdc.balanceOf(address(otc)), 0);
+    }
+
+    function test_FillBuy_FeeSymmetry() public {
+        uint256 makerFee0 = (2000e18 * MAKER_BPS) / 10000;
+        vm.startPrank(user1);
+        usdc.approve(address(otc), 2000e18 + makerFee0);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        uint256 fill = 500e18;
+        uint256 settlement = 1000e18;
+        uint256 makerFee = (settlement * MAKER_BPS) / 10000;
+        uint256 takerFee = (settlement * TAKER_BPS) / 10000;
+
+        uint256 makerUsdc0 = usdc.balanceOf(user1);
+
+        vm.startPrank(user2);
+        base.approve(address(otc), fill);
+        otc.fillOrder(id, fill);
+        vm.stopPrank();
+
+        // base moved taker -> maker
+        assertEq(base.balanceOf(user1), 100_000e18 + fill);
+        assertEq(base.balanceOf(user2), 100_000e18 - fill);
+        // taker receives settlement - takerFee; maker pays settlement + makerFee
+        assertEq(usdc.balanceOf(user2), 100_000e18 + settlement - takerFee);
+        assertEq(usdc.balanceOf(user1), makerUsdc0 - (settlement + makerFee));
+        assertEq(usdc.balanceOf(feeRecipient), makerFee + takerFee);
+        assertEq(usdc.balanceOf(address(otc)), 0);
+    }
+
+    function test_PartialFills() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        vm.startPrank(user2);
+        usdc.approve(address(otc), type(uint256).max);
+        otc.fillOrder(id, 300e18);
+        assertEq(otc.getRemainingAmount(id), 700e18);
+        assertTrue(otc.getOrder(id).isActive);
+        otc.fillOrder(id, 700e18);
+        vm.stopPrank();
+        assertFalse(otc.getOrder(id).isActive);
+        assertEq(base.balanceOf(user2), 100_000e18 + 1000e18);
+    }
+
+    // ---------- cancel / validation ----------
+
+    function test_Cancel_IsFlagFlip_NoFundsMoved() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        uint256 bal = base.balanceOf(user1);
+        otc.cancelOrder(id);
+        vm.stopPrank();
+        assertFalse(otc.getOrder(id).isActive);
+        assertEq(base.balanceOf(user1), bal, "cancel never moves funds");
+    }
+
+    function test_UnfundableOrder_FillReverts_AndViewFalse() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        // maker revokes allowance after posting
+        base.approve(address(otc), 0);
+        vm.stopPrank();
+
+        assertFalse(otc.isOrderFundable(id));
+
+        vm.startPrank(user2);
+        usdc.approve(address(otc), type(uint256).max);
+        vm.expectRevert(); // core pulls base from maker -> insufficient allowance
+        otc.fillOrder(id, 500e18);
+        vm.stopPrank();
+    }
+
+    function test_PruneExpired_Permissionless_OnlyWhenExpired() public {
+        vm.prank(admin);
+        otc.updateDefaultOrderExpiration(1 hours);
+
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        // not yet expired -> skipped, nothing cleaned
+        vm.prank(address(0xDEAD));
+        assertEq(otc.cleanupExpiredOrders(_ids(id)), 0, "not expired: nothing cleaned");
+        assertTrue(otc.getOrder(id).isActive);
+
+        vm.warp(block.timestamp + 2 hours);
+
+        // now anyone can clean it up (permissionless)
+        vm.prank(address(0xDEAD));
+        assertEq(otc.cleanupExpiredOrders(_ids(id)), 1, "expired: cleaned");
+        assertFalse(otc.getOrder(id).isActive);
+    }
+
+    function test_FillReverts_OwnOrder_Expired_RoundsToZero() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), type(uint256).max);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        // own order
+        vm.expectRevert("OTCTrading: cannot fill own order");
+        otc.fillOrder(id, 100e18);
+        vm.stopPrank();
+
+        // rounds to zero: 1e18 base for 1 wei counterparty, fill tiny amount
+        vm.startPrank(user1);
+        uint256 id2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1e18, 1);
+        vm.stopPrank();
+        vm.startPrank(user2);
+        usdc.approve(address(otc), type(uint256).max);
+        vm.expectRevert("OTCTrading: amount rounds to zero");
+        otc.fillOrder(id2, 1e17); // 1e17 * 1 / 1e18 = 0
+        vm.stopPrank();
+    }
+
+    // ---------- native ETH (counterparty token == address(0)) ----------
+
+    /// @dev SELL priced in ETH: allowance-backed, nothing escrowed. Taker pays ETH at fill.
+    function test_ETH_SellOrder_EscrowsNothing() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, ETH, 1000e18, 2e18);
+        vm.stopPrank();
+
+        assertEq(otc.ethEscrowed(id), 0, "SELL escrows nothing");
+        assertEq(address(otc).balance, 0, "contract holds no ETH");
+    }
+
+    function test_ETH_SellOrder_RejectsSentEth() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        vm.expectRevert("OTCTrading: ETH not needed");
+        otc.createOrder{value: 1 ether}(OTCTrading.OrderType.SELL, ETH, 1000e18, 2e18);
+        vm.stopPrank();
+    }
+
+    /// @dev Taker buys base off a SELL order by sending ETH; overpayment is refunded.
+    function test_ETH_FillSell_PayWithEth_RefundsExcess() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, ETH, 1000e18, 2e18);
+        vm.stopPrank();
+
+        uint256 fill = 500e18;
+        uint256 settlement = 1e18; // 500 * 2 / 1000
+        uint256 makerFee = (settlement * MAKER_BPS) / 10000; // 2.5e15
+        uint256 takerFee = (settlement * TAKER_BPS) / 10000; // 5e15
+        uint256 owed = settlement + takerFee;
+
+        uint256 makerEth0 = user1.balance;
+        uint256 takerEth0 = user2.balance;
+
+        vm.prank(user2);
+        otc.fillOrder{value: owed + 0.1 ether}(id, fill); // overpay to exercise the refund
+
+        assertEq(base.balanceOf(user2), 100_000e18 + fill, "taker got base");
+        // Maker proceeds and fees are CREDITED (pull-payment), not pushed.
+        assertEq(user1.balance, makerEth0, "maker balance unchanged until withdraw");
+        assertEq(otc.pendingWithdrawals(user1), settlement - makerFee, "maker proceeds credited");
+        assertEq(otc.pendingWithdrawals(feeRecipient), makerFee + takerFee, "fees credited");
+        // Taker (the active caller) is refunded inline.
+        assertEq(user2.balance, takerEth0 - owed, "taker paid exactly settlement+takerFee (excess refunded)");
+        assertEq(address(otc).balance, owed, "contract holds only credited (claimable) ETH");
+
+        // Maker can pull their proceeds.
+        vm.prank(user1);
+        otc.withdraw();
+        assertEq(user1.balance, makerEth0 + (settlement - makerFee), "maker withdrew proceeds");
+    }
+
+    function test_ETH_FillSell_InsufficientEthReverts() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, ETH, 1000e18, 2e18);
+        vm.stopPrank();
+
+        vm.prank(user2);
+        vm.expectRevert("OTCTrading: insufficient ETH sent");
+        otc.fillOrder{value: 1e15}(id, 500e18); // needs 1e18 + 5e15
+    }
+
+    /// @dev BUY priced in ETH: the one escrowed case. Maker pre-funds counterparty + maker fee.
+    function test_ETH_BuyOrder_EscrowsAtCreation() public {
+        uint256 cpt = 2e18;
+        uint256 makerFee = (cpt * MAKER_BPS) / 10000;
+        uint256 deposit = cpt + makerFee;
+
+        uint256 makerEth0 = user1.balance;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        assertEq(otc.ethEscrowed(id), deposit, "escrow recorded");
+        assertEq(address(otc).balance, deposit, "contract holds the escrow");
+        assertEq(user1.balance, makerEth0 - deposit, "maker funded the escrow");
+    }
+
+    function test_ETH_BuyOrder_WrongValueReverts() public {
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+
+        vm.startPrank(user1);
+        vm.expectRevert("OTCTrading: incorrect ETH amount");
+        otc.createOrder{value: deposit - 1}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        vm.expectRevert("OTCTrading: incorrect ETH amount");
+        otc.createOrder{value: deposit + 1}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+        vm.stopPrank();
+    }
+
+    /// @dev Taker sells base into a BUY+ETH order and is paid native ETH out of the escrow.
+    function test_ETH_FillBuy_TakerReceivesEth() public {
+        uint256 cpt = 2e18;
+        uint256 makerFeeTotal = (cpt * MAKER_BPS) / 10000;
+        uint256 deposit = cpt + makerFeeTotal;
+
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        uint256 fill = 500e18;
+        uint256 settlement = 1e18;
+        uint256 makerFee = (settlement * MAKER_BPS) / 10000;
+        uint256 takerFee = (settlement * TAKER_BPS) / 10000;
+
+        uint256 takerEth0 = user2.balance;
+        vm.startPrank(user2);
+        base.approve(address(otc), fill);
+        otc.fillOrder(id, fill); // no ETH sent: proceeds come from escrow
+        vm.stopPrank();
+
+        assertEq(base.balanceOf(user1), 100_000e18 + fill, "maker got base");
+        // Taker (active caller) is paid inline out of escrow; fees are credited.
+        assertEq(user2.balance, takerEth0 + (settlement - takerFee), "taker received native ETH");
+        assertEq(otc.pendingWithdrawals(feeRecipient), makerFee + takerFee, "fees credited");
+        // Escrow drawn down by exactly this fill's cost (proceeds + both fees).
+        assertEq(otc.ethEscrowed(id), deposit - (settlement + makerFee), "escrow decremented");
+        assertEq(
+            address(otc).balance,
+            otc.ethEscrowed(id) + otc.pendingWithdrawals(feeRecipient),
+            "contract balance == remaining escrow + credited fees"
+        );
+    }
+
+    function test_ETH_FillBuy_RejectsSentEth() public {
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        vm.startPrank(user2);
+        base.approve(address(otc), 500e18);
+        vm.expectRevert("OTCTrading: ETH not needed");
+        otc.fillOrder{value: 1 ether}(id, 500e18);
+        vm.stopPrank();
+    }
+
+    /// @dev A fully-filled BUY+ETH order leaves no escrow behind; only credited fees remain until
+    /// the fee recipient withdraws.
+    function test_ETH_FillBuy_FullFill_DrainsEscrow() public {
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        vm.startPrank(user2);
+        base.approve(address(otc), 1000e18);
+        otc.fillOrder(id, 1000e18);
+        vm.stopPrank();
+
+        assertEq(otc.ethEscrowed(id), 0, "escrow fully drawn down");
+        assertEq(address(otc).balance, otc.pendingWithdrawals(feeRecipient), "only credited fees remain");
+
+        vm.prank(feeRecipient);
+        otc.withdraw();
+        assertEq(address(otc).balance, 0, "no ETH left after fee recipient withdraws");
+    }
+
+    function test_ETH_CancelRefundsRemainingEscrow() public {
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        // Partially fill, then cancel the rest.
+        vm.startPrank(user2);
+        base.approve(address(otc), 500e18);
+        otc.fillOrder(id, 500e18);
+        vm.stopPrank();
+
+        uint256 remaining = otc.ethEscrowed(id);
+        assertGt(remaining, 0, "escrow remains after partial fill");
+
+        uint256 makerEth0 = user1.balance;
         vm.prank(user1);
         otc.cancelOrder(id);
 
-        // Remaining settlement + its maker fee are refunded to the maker.
-        uint256 remainingSettlement = ((baseAmount - fill) * usdcAmount) / baseAmount; // 1200
-        uint256 remainingMakerFee = (remainingSettlement * otc.makerFeeBps()) / 10000; // 3
+        assertEq(otc.ethEscrowed(id), 0, "escrow zeroed");
+        assertEq(otc.pendingWithdrawals(user1), remaining, "remainder credited to maker");
 
-        // Taker received settlement - taker fee; fee recipient got both fees for the fill.
-        assertEq(usdc.balanceOf(user2), takerUsdcStart + settlement - fillTakerFee);
-        assertEq(usdc.balanceOf(feeRecipient), fillMakerFee + fillTakerFee);
-
-        // Maker's net USDC outlay = filled settlement + its maker fee only.
-        uint256 makerRefund = remainingSettlement + remainingMakerFee;
-        assertEq(usdc.balanceOf(user1), makerUsdcStart - (usdcAmount + makerFee) + makerRefund);
-
-        // Contract holds no leftover USDC for this order — exactly solvent.
-        assertEq(usdc.balanceOf(address(otc)), 0, "BUY order left dust / overspent");
+        vm.prank(user1);
+        otc.withdraw();
+        assertEq(user1.balance, makerEth0 + remaining, "maker withdrew the remainder");
     }
 
-    /// A fill whose computed counterparty amount rounds down to zero must revert.
-    function test_Security_RoundingToZeroReverts() public {
-        // SELL 1e18 base for 1 wei counterparty (passes creation price check).
-        uint256 baseAmount = 1e18;
+    function test_ETH_CleanupExpiredRefundsMaker() public {
+        otc.updateDefaultOrderExpiration(1 days);
+
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        vm.warp(block.timestamp + 2 days);
+
+        uint256 makerEth0 = user1.balance;
+        uint256 pruneEth0 = user2.balance;
+        vm.prank(user2); // a third party cleans up; they must gain nothing
+        otc.cleanupExpiredOrders(_ids(id));
+
+        assertEq(otc.pendingWithdrawals(user1), deposit, "escrow credited to the MAKER");
+        assertEq(otc.pendingWithdrawals(user2), 0, "cleaner gained nothing");
+        assertEq(user2.balance, pruneEth0, "cleaner balance unchanged");
+
+        vm.prank(user1);
+        otc.withdraw();
+        assertEq(user1.balance, makerEth0 + deposit, "maker withdrew the escrow");
+    }
+
+    function test_ETH_AdminCancelRefundsMakerNotAdmin() public {
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        uint256 makerEth0 = user1.balance;
+        otc.adminCancelOrder(id); // admin (this)
+
+        assertEq(otc.pendingWithdrawals(user1), deposit, "escrow credited to the MAKER");
+        assertEq(otc.pendingWithdrawals(admin), 0, "admin credited nothing");
+
+        vm.prank(user1);
+        otc.withdraw();
+        assertEq(user1.balance, makerEth0 + deposit, "maker withdrew the escrow");
+    }
+
+    /// @dev The escrow is always fundable; an allowance-backed order is not.
+    function test_ETH_BuyOrderAlwaysFundable() public {
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        assertTrue(otc.isOrderFundable(id), "escrowed order is fundable by construction");
+    }
+
+    /// @dev H-1 fix: a maker that cannot receive ETH no longer blocks cancel/force-cancel. The
+    /// refund is CREDITED (pull-payment), so the order deactivates cleanly and the funds sit
+    /// claimable. (The maker withdrawing later is the maker's own problem, not a liveness risk.)
+    function test_ETH_RefundToNonReceiverIsCredited_H1() public {
+        EthRejecter rejecter = new EthRejecter();
+        otc.addToWhitelist(address(rejecter));
+        vm.deal(address(rejecter), 10 ether);
+
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        uint256 id = rejecter.createBuyEth{value: deposit}(otc, 1000e18, cpt);
+
+        // Maker (a non-receiving contract) can cancel — no revert.
+        vm.prank(address(rejecter));
+        otc.cancelOrder(id);
+
+        assertFalse(otc.getOrder(id).isActive, "order deactivated");
+        assertEq(otc.ethEscrowed(id), 0, "escrow released");
+        assertEq(otc.pendingWithdrawals(address(rejecter)), deposit, "refund credited, not lost");
+    }
+
+    /// @dev H-1 fix: admin force-cancel of a non-receiving maker's order also succeeds, and a hostile
+    /// order can no longer poison an admin batch.
+    function test_ETH_AdminCancelNonReceiver_DoesNotBlock_H1() public {
+        EthRejecter rejecter = new EthRejecter();
+        otc.addToWhitelist(address(rejecter));
+        vm.deal(address(rejecter), 10 ether);
+
+        uint256 cpt = 2e18;
+        uint256 deposit = cpt + (cpt * MAKER_BPS) / 10000;
+        uint256 badId = rejecter.createBuyEth{value: deposit}(otc, 1000e18, cpt);
+
+        // A normal order in the same batch must still be cancelled.
+        vm.prank(user1);
+        uint256 goodId = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000e18, cpt);
+
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = badId;
+        ids[1] = goodId;
+        otc.adminCancelOrders(ids); // must not revert
+
+        assertFalse(otc.getOrder(badId).isActive, "hostile order cancelled");
+        assertFalse(otc.getOrder(goodId).isActive, "batch not poisoned");
+        assertEq(otc.pendingWithdrawals(address(rejecter)), deposit, "hostile maker credited");
+        assertEq(otc.pendingWithdrawals(user1), deposit, "normal maker credited");
+    }
+
+    /// @dev M-1 fix: a fee recipient that cannot receive ETH no longer blocks ETH settlement — the
+    /// fee is credited instead of pushed.
+    function test_ETH_RevertingFeeRecipientDoesNotBlockFills_M1() public {
+        address badFee = address(new EthRejecter());
+        otc.updateFeeRecipient(badFee);
+
         vm.startPrank(user1);
-        baseToken.mint(user1, baseAmount);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, 1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, ETH, 1000e18, 2e18);
         vm.stopPrank();
 
-        // Filling 1e17 base -> counterparty = 1e17 * 1 / 1e18 = 0. Must revert.
-        vm.startPrank(user2);
-        vm.expectRevert("OTCTrading: amount rounds to zero");
-        otc.fillOrder(id, 1e17);
-        vm.stopPrank();
+        uint256 settlement = 1e18;
+        uint256 takerFee = (settlement * TAKER_BPS) / 10000;
+
+        vm.prank(user2);
+        otc.fillOrder{value: settlement + takerFee}(id, 500e18); // succeeds despite bad fee recipient
+
+        uint256 makerFee = (settlement * MAKER_BPS) / 10000;
+        assertEq(otc.pendingWithdrawals(badFee), makerFee + takerFee, "fee credited to (bad) recipient");
     }
 
-    /// Fees are snapshotted at order creation; a later admin fee change must not
-    /// apply retroactively to an order already on the book.
-    function test_Security_FeesAreSnapshotted() public {
-        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
-        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
-
+    /// @dev M-2 fix: a de-whitelisted maker's resting order can no longer be filled.
+    function test_ETH_DewhitelistedMakerCannotBeFilled_M2() public {
         vm.startPrank(user1);
-        baseToken.approve(address(otc), baseAmount);
-        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
         vm.stopPrank();
 
-        OTCTrading.Order memory order = otc.getOrder(id);
-        assertEq(order.makerFeeBps, 25);
-        assertEq(order.takerFeeBps, 50);
-
-        // Admin raises fees to the maximum after the order exists.
-        vm.prank(admin);
-        otc.updateFees(1000, 1000);
-
-        // Fill should use the snapshotted 25/50 bps, not the new 1000/1000.
-        uint256 makerFee = (usdcAmount * 25) / 10000;
-        uint256 takerFee = (usdcAmount * 50) / 10000;
-        uint256 feeRecipientBefore = usdc.balanceOf(feeRecipient);
+        otc.removeFromWhitelist(user1); // maker offboarded
 
         vm.startPrank(user2);
-        usdc.approve(address(otc), usdcAmount + takerFee);
-        otc.fillOrder(id, baseAmount);
+        usdc.approve(address(otc), type(uint256).max);
+        vm.expectRevert("OTCTrading: maker not whitelisted");
+        otc.fillOrder(id, 1000e18);
         vm.stopPrank();
-
-        assertEq(usdc.balanceOf(feeRecipient), feeRecipientBefore + makerFee + takerFee);
     }
 
-    /// emergencyWithdraw must be blocked unless the contract is paused.
-    function test_Security_EmergencyWithdrawRequiresPause() public {
-        vm.deal(address(otc), 1 ether);
-        vm.prank(admin);
-        vm.expectRevert(); // ExpectedPause()
-        otc.emergencyWithdraw(address(0), address(0x999), 0);
+    /// @dev L-1 fix: rounding dust left after the closing fill is credited to the maker, not stranded.
+    function test_ETH_DustCreditedToMakerOnFullFill_L1() public {
+        // Price 999 wei per 1000 base so per-fill settlement floors and leaves 1 wei dust.
+        uint256 deposit = 999 + (uint256(999) * MAKER_BPS) / 10000; // 999 + 2 = 1001
+        vm.prank(user1);
+        uint256 id = otc.createOrder{value: deposit}(OTCTrading.OrderType.BUY, ETH, 1000, 999);
+
+        vm.startPrank(user2);
+        base.approve(address(otc), 1000);
+        otc.fillOrder(id, 500); // draws 500
+        otc.fillOrder(id, 500); // draws 500, closes order, 1 wei dust remains
+        vm.stopPrank();
+
+        assertFalse(otc.getOrder(id).isActive, "order complete");
+        assertEq(otc.ethEscrowed(id), 0, "escrow fully released (dust included)");
+        assertEq(otc.pendingWithdrawals(user1), 1, "dust credited to maker");
+    }
+
+    function test_Withdraw_RevertsWhenNothingOwed() public {
+        vm.prank(user1);
+        vm.expectRevert("OTCTrading: nothing to withdraw");
+        otc.withdraw();
+    }
+
+    /// @dev No receive()/fallback: raw ETH sent to the contract is rejected.
+    function test_ETH_DirectTransferRejected() public {
+        vm.prank(user1);
+        (bool ok,) = address(otc).call{value: 1 ether}("");
+        assertFalse(ok, "direct ETH transfers are rejected");
+    }
+
+    // ---------- admin cancel ----------
+
+    function test_AdminCancel_DeactivatesAnyOrder_NoFundsMoved() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 bal = base.balanceOf(user1);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        // admin (this) force-cancels a maker's active order
+        otc.adminCancelOrder(id);
+
+        assertFalse(otc.getOrder(id).isActive);
+        assertEq(base.balanceOf(user1), bal, "admin cancel moves no funds");
+        assertEq(base.balanceOf(address(otc)), 0);
+    }
+
+    function test_AdminCancel_NonAdminReverts() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        vm.prank(user2); // not admin, and not the maker
+        vm.expectRevert();
+        otc.adminCancelOrder(id);
+
+        vm.prank(user1); // even the maker cannot use the admin path
+        vm.expectRevert();
+        otc.adminCancelOrder(id);
+    }
+
+    function test_AdminCancel_RevertsIfInactive() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        otc.cancelOrder(id);
+        vm.stopPrank();
+
+        vm.expectRevert("OTCTrading: order not active");
+        otc.adminCancelOrder(id);
+    }
+
+    function test_AdminCancel_PreventsFill() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        otc.adminCancelOrder(id);
+
+        vm.startPrank(user2);
+        usdc.approve(address(otc), type(uint256).max);
+        vm.expectRevert("OTCTrading: order not active");
+        otc.fillOrder(id, 500e18);
+        vm.stopPrank();
+    }
+
+    function test_AdminCancelBatch_SkipsInactive() public {
+        vm.startPrank(user1);
+        base.approve(address(otc), type(uint256).max);
+        uint256 id1 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        uint256 id2 = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        otc.cancelOrder(id1); // already inactive
+        vm.stopPrank();
+
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = id1;
+        ids[1] = id2;
+        otc.adminCancelOrders(ids);
+
+        assertFalse(otc.getOrder(id1).isActive);
+        assertFalse(otc.getOrder(id2).isActive);
+    }
+
+    // ---------- upgradeability (UUPS) ----------
+
+    function test_Upgrade_AdminHoldsUpgraderRole() public view {
+        assertTrue(otc.hasRole(otc.UPGRADER_ROLE(), admin));
+    }
+
+    function test_Upgrade_NonUpgraderReverts() public {
+        address newImpl = address(new OTCTrading());
+        vm.prank(user1); // no UPGRADER_ROLE
+        vm.expectRevert();
+        otc.upgradeToAndCall(newImpl, "");
+    }
+
+    function test_Upgrade_UpgraderCanUpgrade_StatePersists() public {
+        // seed some state before the upgrade
+        vm.startPrank(user1);
+        base.approve(address(otc), 1000e18);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), 1000e18, 2000e18);
+        vm.stopPrank();
+
+        address implBefore = _impl();
+        address newImpl = address(new OTCTrading());
+
+        // admin holds UPGRADER_ROLE
+        otc.upgradeToAndCall(newImpl, "");
+
+        assertEq(_impl(), newImpl, "implementation swapped");
+        assertTrue(_impl() != implBefore);
+        // storage persists across the upgrade
+        assertEq(otc.makerFeeBps(), MAKER_BPS);
+        assertEq(otc.baseToken(), address(base));
+        assertTrue(otc.getOrder(id).isActive);
+        assertEq(otc.getOrder(id).maker, user1);
+    }
+
+    function test_Upgrade_CannotReinitialize() public {
+        vm.expectRevert(); // InvalidInitialization
+        otc.initialize(address(base), address(usdc), feeRecipient, admin, MAKER_BPS, TAKER_BPS, 100, 0, 0, true);
+    }
+
+    /// @dev Read the EIP-1967 implementation slot of the proxy.
+    function _impl() internal view returns (address) {
+        bytes32 slot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+        return address(uint160(uint256(vm.load(address(otc), slot))));
     }
 }
