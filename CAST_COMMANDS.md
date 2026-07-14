@@ -174,16 +174,21 @@ cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
 
 **Example (BUY with ETH counterparty):**
 ```bash
-# BUY order: buy 1000 BASE tokens for 2 ETH. ETH is sent as value.
+# BUY order: buy 1000 BASE tokens for 2 ETH.
+# The maker pre-funds the maker fee, so the ETH sent = price + maker fee.
+# With the default 25 bps maker fee: 2 ETH + 0.005 ETH = 2.005 ETH.
 # Requires ETH (address(0)) to be an allowed counterparty token.
 cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
   0 \
   0x0000000000000000000000000000000000000000 \
   1000000000000000000000 \
   2000000000000000000 \
-  --value 2000000000000000000 \
+  --value 2005000000000000000 \
   --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
+
+> **Note for BUY orders (ERC-20 counterparty):** approve `counterpartyTokenAmount + makerFee`
+> before calling `createOrder`, since the maker pre-funds the maker fee.
 
 ### Fill Order
 
@@ -502,7 +507,8 @@ cast logs --from-block 0 "OrderCancelled(uint256,address)" --rpc-url $RPC_URL
 - Always approve tokens before creating or filling orders
 - Order type is the first `createOrder` argument: `0` = BUY, `1` = SELL
 - **SELL orders:** the taker pays `counterpartyAmount + takerFee`; the maker receives `counterpartyAmount − makerFee`
-- **BUY orders:** the taker receives `counterpartyAmount − makerFee − takerFee` from the maker's deposited pot
+- **BUY orders:** the maker deposits `counterpartyAmount + makerFee` at creation; the taker (seller) receives `counterpartyAmount − takerFee`
+- The order creator (maker) always bears the maker fee; the filler (taker) always bears the taker fee
 - Fee rates are snapshotted per order at creation and are not affected by later `updateFees` calls
 - Orders can be filled partially or fully
 - Only the order maker can cancel their order

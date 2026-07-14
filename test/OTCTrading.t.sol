@@ -234,11 +234,14 @@ contract OTCTradingTest is Test {
 
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 ethAmount = 2 ether;
+        // BUY makers pre-fund the maker fee (Variant A), so the deposit is amount + makerFee.
+        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
+        uint256 totalDeposit = ethAmount + makerFeeDeposit;
 
         vm.startPrank(user1);
         vm.deal(user1, 10 ether); // Give user1 some ETH
         uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount}(
+        uint256 orderId = otc.createOrder{value: totalDeposit}(
             OTCTrading.OrderType.BUY,
             address(0), // ETH
             baseAmount,
@@ -255,9 +258,9 @@ contract OTCTradingTest is Test {
         assertEq(order.counterpartyTokenAmount, ethAmount);
         assertTrue(order.isActive);
 
-        // Check ETH was deposited
-        assertEq(user1.balance, user1BalanceBefore - ethAmount);
-        assertEq(address(otc).balance, ethAmount);
+        // Check ETH was deposited (amount + pre-funded maker fee)
+        assertEq(user1.balance, user1BalanceBefore - totalDeposit);
+        assertEq(address(otc).balance, totalDeposit);
     }
 
     function test_CreateSellOrderWithETHCounterparty() public {
@@ -323,10 +326,13 @@ contract OTCTradingTest is Test {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 ethAmount = 2 ether;
 
-        // Create BUY order (user1 buys base tokens with ETH)
+        // Create BUY order (user1 buys base tokens with ETH); maker pre-funds maker fee.
+        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
-        uint256 orderId = otc.createOrder{value: ethAmount}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
+        uint256 orderId = otc.createOrder{value: ethAmount + makerFeeDeposit}(
+            OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount
+        );
         vm.stopPrank();
 
         // Fill order (user2 sells base tokens for ETH)
@@ -346,9 +352,8 @@ contract OTCTradingTest is Test {
 
         // Check balances
         assertEq(baseToken.balanceOf(user1), user1BaseBefore + fillAmount);
-        // BUY settlement now deducts BOTH fees from the maker-funded pot so the
-        // contract stays solvent; taker receives amount - takerFee - makerFee.
-        assertEq(user2.balance, user2EthBefore + expectedEthAmount - takerFee - makerFee);
+        // Variant A: maker fee was pre-funded; taker (seller) only bears the taker fee.
+        assertEq(user2.balance, user2EthBefore + expectedEthAmount - takerFee);
         assertEq(feeRecipient.balance, feeRecipientEthBefore + makerFee + takerFee);
     }
 
@@ -360,15 +365,18 @@ contract OTCTradingTest is Test {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 ethAmount = 2 ether;
 
-        // Create BUY order
+        // Create BUY order (maker pre-funds maker fee)
+        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
         uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
+        uint256 orderId = otc.createOrder{value: ethAmount + makerFeeDeposit}(
+            OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount
+        );
         otc.cancelOrder(orderId);
         vm.stopPrank();
 
-        // Check that ETH was returned
+        // Check that the full deposit (amount + maker fee) was returned
         assertEq(user1.balance, user1BalanceBefore);
         OTCTrading.Order memory order = otc.getOrder(orderId);
         assertFalse(order.isActive);
@@ -420,9 +428,11 @@ contract OTCTradingTest is Test {
     function test_CreateBuyOrderWithERC20() public {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
+        // BUY makers pre-fund the maker fee (Variant A).
+        uint256 makerFeeDeposit = (usdcAmount * otc.makerFeeBps()) / 10000;
 
         vm.startPrank(user1);
-        usdc.approve(address(otc), usdcAmount);
+        usdc.approve(address(otc), usdcAmount + makerFeeDeposit);
         uint256 orderId = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
         vm.stopPrank();
 
@@ -440,9 +450,10 @@ contract OTCTradingTest is Test {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
 
-        // Create BUY order (user1 buys base tokens with USDC)
+        // Create BUY order (user1 buys base tokens with USDC); maker pre-funds maker fee.
+        uint256 makerFeeDeposit = (usdcAmount * otc.makerFeeBps()) / 10000;
         vm.startPrank(user1);
-        usdc.approve(address(otc), usdcAmount);
+        usdc.approve(address(otc), usdcAmount + makerFeeDeposit);
         uint256 orderId = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
         vm.stopPrank();
 
@@ -463,9 +474,8 @@ contract OTCTradingTest is Test {
 
         // Check balances
         assertEq(baseToken.balanceOf(user1), user1BaseBefore + fillAmount);
-        // BUY settlement now deducts BOTH fees from the maker-funded pot so the
-        // contract stays solvent; taker receives amount - takerFee - makerFee.
-        assertEq(usdc.balanceOf(user2), user2UsdcBefore + expectedUsdcAmount - takerFee - makerFee);
+        // Variant A: maker fee was pre-funded; taker (seller) only bears the taker fee.
+        assertEq(usdc.balanceOf(user2), user2UsdcBefore + expectedUsdcAmount - takerFee);
         assertEq(usdc.balanceOf(feeRecipient), feeRecipientUsdcBefore + makerFee + takerFee);
     }
 
@@ -473,15 +483,16 @@ contract OTCTradingTest is Test {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
 
-        // Create BUY order
+        // Create BUY order (maker pre-funds maker fee)
+        uint256 makerFeeDeposit = (usdcAmount * otc.makerFeeBps()) / 10000;
         vm.startPrank(user1);
         uint256 usdcBefore = usdc.balanceOf(user1);
-        usdc.approve(address(otc), usdcAmount);
+        usdc.approve(address(otc), usdcAmount + makerFeeDeposit);
         uint256 orderId = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
         otc.cancelOrder(orderId);
         vm.stopPrank();
 
-        // Check that USDC was returned
+        // Check that the full deposit (amount + maker fee) was returned
         assertEq(usdc.balanceOf(user1), usdcBefore);
         OTCTrading.Order memory order = otc.getOrder(orderId);
         assertFalse(order.isActive);
@@ -1147,11 +1158,14 @@ contract OTCTradingTest is Test {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 ethAmount = 2 ether;
 
-        // Create BUY order with ETH
+        // Create BUY order with ETH (maker pre-funds maker fee)
+        uint256 makerFeeDeposit = (ethAmount * otc.makerFeeBps()) / 10000;
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
         uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
+        uint256 orderId = otc.createOrder{value: ethAmount + makerFeeDeposit}(
+            OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount
+        );
         vm.stopPrank();
 
         // Fast forward time
@@ -1166,7 +1180,7 @@ contract OTCTradingTest is Test {
 
         assertEq(cleaned, 1);
         assertFalse(otc.getOrder(orderId).isActive);
-        assertEq(user1.balance, user1BalanceBefore); // ETH was returned
+        assertEq(user1.balance, user1BalanceBefore); // full deposit (amount + maker fee) returned
 
         // Reset expiration
         vm.prank(admin);
@@ -1815,15 +1829,17 @@ contract OTCTradingTest is Test {
     function test_Security_BuyOrderStaysSolvent() public {
         uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
         uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
+        uint256 makerFee = (usdcAmount * otc.makerFeeBps()) / 10000;
+        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
 
-        // Maker funds exactly usdcAmount.
+        // Variant A: maker deposits the amount PLUS the pre-funded maker fee.
         vm.startPrank(user1);
-        usdc.approve(address(otc), usdcAmount);
+        uint256 user2StartUsdc = usdc.balanceOf(user2);
+        usdc.approve(address(otc), usdcAmount + makerFee);
         uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
         vm.stopPrank();
 
-        uint256 contractBefore = usdc.balanceOf(address(otc));
-        assertEq(contractBefore, usdcAmount);
+        assertEq(usdc.balanceOf(address(otc)), usdcAmount + makerFee);
 
         // Taker fully fills.
         vm.startPrank(user2);
@@ -1831,15 +1847,58 @@ contract OTCTradingTest is Test {
         otc.fillOrder(id, baseAmount);
         vm.stopPrank();
 
-        // The order's entire pot is consumed and nothing more: the contract's
+        // The order's entire deposit is consumed and nothing more: the contract's
         // USDC balance returns to its pre-order level (zero here).
-        assertEq(usdc.balanceOf(address(otc)), 0, "BUY fill overspent the pot");
+        assertEq(usdc.balanceOf(address(otc)), 0, "BUY fill overspent the deposit");
 
-        // Sum of outflows equals exactly what the maker deposited.
-        uint256 makerFee = (usdcAmount * otc.makerFeeBps()) / 10000;
-        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
-        assertEq(usdc.balanceOf(user2), (usdcAmount - makerFee - takerFee) + 100000 * 10 ** usdc.decimals());
+        // Taker (seller) bears only the taker fee; maker fee was pre-funded.
+        assertEq(usdc.balanceOf(user2), user2StartUsdc + usdcAmount - takerFee);
         assertEq(usdc.balanceOf(feeRecipient), makerFee + takerFee);
+    }
+
+    /// Variant A: after a partial fill, cancelling a BUY order refunds the unused
+    /// settlement AND the unused pre-funded maker fee, leaving the contract solvent.
+    function test_Security_BuyOrderPartialFillThenCancelRefundsMakerFee() public {
+        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
+        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
+        uint256 makerFee = (usdcAmount * otc.makerFeeBps()) / 10000; // full-order maker fee
+
+        // Maker deposits amount + maker fee.
+        vm.startPrank(user1);
+        uint256 makerUsdcStart = usdc.balanceOf(user1);
+        usdc.approve(address(otc), usdcAmount + makerFee);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
+        vm.stopPrank();
+
+        // Taker fills 40% (400 base).
+        uint256 fill = 400 * 10 ** baseToken.decimals();
+        uint256 settlement = (fill * usdcAmount) / baseAmount; // 800
+        uint256 fillMakerFee = (settlement * otc.makerFeeBps()) / 10000; // 2
+        uint256 fillTakerFee = (settlement * otc.takerFeeBps()) / 10000; // 4
+        vm.startPrank(user2);
+        uint256 takerUsdcStart = usdc.balanceOf(user2);
+        baseToken.approve(address(otc), fill);
+        otc.fillOrder(id, fill);
+        vm.stopPrank();
+
+        // Maker cancels the remaining 60%.
+        vm.prank(user1);
+        otc.cancelOrder(id);
+
+        // Remaining settlement + its maker fee are refunded to the maker.
+        uint256 remainingSettlement = ((baseAmount - fill) * usdcAmount) / baseAmount; // 1200
+        uint256 remainingMakerFee = (remainingSettlement * otc.makerFeeBps()) / 10000; // 3
+
+        // Taker received settlement - taker fee; fee recipient got both fees for the fill.
+        assertEq(usdc.balanceOf(user2), takerUsdcStart + settlement - fillTakerFee);
+        assertEq(usdc.balanceOf(feeRecipient), fillMakerFee + fillTakerFee);
+
+        // Maker's net USDC outlay = filled settlement + its maker fee only.
+        uint256 makerRefund = remainingSettlement + remainingMakerFee;
+        assertEq(usdc.balanceOf(user1), makerUsdcStart - (usdcAmount + makerFee) + makerRefund);
+
+        // Contract holds no leftover USDC for this order — exactly solvent.
+        assertEq(usdc.balanceOf(address(otc)), 0, "BUY order left dust / overspent");
     }
 
     /// A fill whose computed counterparty amount rounds down to zero must revert.

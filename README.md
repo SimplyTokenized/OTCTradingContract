@@ -87,13 +87,15 @@ maker receives    = counterpartyAmount − makerFee
 fee recipient     = makerFee + takerFee
 ```
 
-**BUY order** (both fees are drawn from the maker's deposited pot, keeping the contract solvent):
+**BUY order** (mirror of SELL: the maker pre-funds the maker fee at creation, the taker's fee is deducted from proceeds):
 
 ```
-maker deposited   = counterpartyAmount
-taker receives    = counterpartyAmount − makerFee − takerFee
+maker deposits    = counterpartyAmount + makerFee
+taker receives    = counterpartyAmount − takerFee
 fee recipient     = makerFee + takerFee
 ```
+
+The fee incidence follows the maker/taker role in both directions: the order creator (maker) always bears the maker fee, and the filler (taker) always bears the taker fee. On cancellation or cleanup, the unfilled portion of the deposit — including the still-unused maker fee — is refunded to the maker.
 
 **Worked example — SELL 1000 BASE for 2000 USDC, fully filled (25/50 bps):**
 
@@ -183,7 +185,7 @@ After deploying, **use the proxy address** for all interactions. See [`CAST_COMM
 
 | Function | Description |
 |----------|-------------|
-| `createOrder(OrderType orderType, address counterpartyToken, uint256 baseTokenAmount, uint256 counterpartyTokenAmount)` `payable` → `uint256 orderId` | Create a BUY or SELL order. For a SELL, the base token is pulled from the maker. For a BUY, the counterparty token is pulled (or ETH must be sent as `msg.value`). |
+| `createOrder(OrderType orderType, address counterpartyToken, uint256 baseTokenAmount, uint256 counterpartyTokenAmount)` `payable` → `uint256 orderId` | Create a BUY or SELL order. For a SELL, `baseTokenAmount` of the base token is pulled from the maker. For a BUY, `counterpartyTokenAmount + makerFee` of the counterparty token is pulled (or must be sent as `msg.value` when the counterparty is ETH). |
 | `fillOrder(uint256 orderId, uint256 baseTokenAmount)` `payable` | Fill an order partially or fully. |
 | `cancelOrder(uint256 orderId)` | Cancel your own order and reclaim the unfilled remainder. |
 | `batchCancelOrders(uint256[] orderIds)` | Cancel multiple of your own orders. |

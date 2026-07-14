@@ -367,12 +367,17 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             IERC20(baseToken).safeTransferFrom(msg.sender, address(this), baseTokenAmount);
             require(msg.value == 0, "OTCTrading: ETH not needed for SELL order");
         } else {
-            // BUY order: maker deposits counterparty tokens
+            // BUY order: maker deposits the counterparty amount PLUS the maker fee.
+            // The maker (buyer) bears the maker fee; the taker (seller) bears the
+            // taker fee, deducted from proceeds at fill time. This mirrors the SELL
+            // path so the fee incidence follows the maker/taker roles consistently.
+            uint256 makerFeeDeposit = (counterpartyTokenAmount * makerFeeBps) / 10000;
+            uint256 totalDeposit = counterpartyTokenAmount + makerFeeDeposit;
             if (_isETH(counterpartyToken)) {
-                require(msg.value == counterpartyTokenAmount, "OTCTrading: incorrect ETH amount");
+                require(msg.value == totalDeposit, "OTCTrading: incorrect ETH amount");
             } else {
                 require(msg.value == 0, "OTCTrading: ETH not needed for ERC20 token");
-                IERC20(counterpartyToken).safeTransferFrom(msg.sender, address(this), counterpartyTokenAmount);
+                IERC20(counterpartyToken).safeTransferFrom(msg.sender, address(this), totalDeposit);
             }
         }
 
@@ -495,12 +500,13 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             // Taker provides base tokens, receives counterparty tokens
 
             // Calculate fees on counterparty tokens using the order's snapshotted rates.
-            // The maker funded exactly `counterpartyTokenAmount` at creation, so both
-            // fees are drawn from that settlement pot (taker receives the remainder).
-            // This keeps total disbursement == amount deposited and the contract solvent.
+            // The maker fee was pre-funded by the maker at creation; the taker fee is
+            // deducted from the taker's (seller's) proceeds here. Total disbursed is
+            // `settlement + makerFee`, which is exactly what the maker deposited for
+            // this fill, so the contract stays solvent.
             uint256 makerFee = (counterpartyTokenAmount * order.makerFeeBps) / 10000;
             uint256 takerFee = (counterpartyTokenAmount * order.takerFeeBps) / 10000;
-            uint256 takerProceeds = counterpartyTokenAmount - makerFee - takerFee;
+            uint256 takerProceeds = counterpartyTokenAmount - takerFee;
 
             // Transfer base tokens from taker
             require(msg.value == 0, "OTCTrading: ETH not needed");
@@ -512,7 +518,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             uint256 totalFee = makerFee + takerFee;
 
             if (_isETH(order.counterpartyToken)) {
-                // ETH counterparty: transfer ETH to taker (minus both fees)
+                // ETH counterparty: transfer ETH to taker (minus taker fee)
                 (bool takerSuccess,) = payable(msg.sender).call{value: takerProceeds}("");
                 require(takerSuccess, "OTCTrading: ETH transfer to taker failed");
 
@@ -522,7 +528,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
                     require(feeSuccess, "OTCTrading: ETH fee transfer failed");
                 }
             } else {
-                // ERC20 counterparty: transfer to taker (minus both fees)
+                // ERC20 counterparty: transfer to taker (minus taker fee)
                 IERC20(order.counterpartyToken).safeTransfer(msg.sender, takerProceeds);
 
                 // Transfer fees to fee recipient (from counterparty tokens held by contract)
@@ -542,6 +548,28 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
     }
 
     /**
+     * @dev Refund the unfilled portion of a BUY order to its maker: the remaining
+     * counterparty amount plus the still-unused maker-fee that was pre-funded at
+     * creation. Using the same floor-division basis as fills guarantees the sum of
+     * all fill outflows and this refund never exceeds the maker's original deposit.
+     * @param order Storage reference to the BUY order
+     * @param remainingBaseAmount Unfilled base amount
+     */
+    function _refundBuyOrder(Order storage order, uint256 remainingBaseAmount) private {
+        uint256 remainingCounterpartyAmount =
+            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
+        uint256 makerFeeRefund = (remainingCounterpartyAmount * order.makerFeeBps) / 10000;
+        uint256 refund = remainingCounterpartyAmount + makerFeeRefund;
+
+        if (_isETH(order.counterpartyToken)) {
+            (bool success,) = payable(order.maker).call{value: refund}("");
+            require(success, "OTCTrading: ETH refund failed");
+        } else {
+            IERC20(order.counterpartyToken).safeTransfer(order.maker, refund);
+        }
+    }
+
+    /**
      * @dev Cancel an order
      * @param orderId ID of the order to cancel
      */
@@ -557,15 +585,8 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             // SELL order: return remaining base tokens to maker
             IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
         } else {
-            // BUY order: return remaining counterparty tokens to maker
-            uint256 remainingCounterpartyAmount =
-                (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
-            if (_isETH(order.counterpartyToken)) {
-                (bool success,) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
-                require(success, "OTCTrading: ETH refund failed");
-            } else {
-                IERC20(order.counterpartyToken).safeTransfer(order.maker, remainingCounterpartyAmount);
-            }
+            // BUY order: return remaining counterparty tokens + unused maker fee
+            _refundBuyOrder(order, remainingBaseAmount);
         }
 
         // Mark order as inactive
@@ -715,14 +736,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
                     if (order.orderType == OrderType.SELL) {
                         IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
                     } else {
-                        uint256 remainingCounterpartyAmount =
-                            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
-                        if (_isETH(order.counterpartyToken)) {
-                            (bool success,) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
-                            require(success, "OTCTrading: ETH refund failed");
-                        } else {
-                            IERC20(order.counterpartyToken).safeTransfer(order.maker, remainingCounterpartyAmount);
-                        }
+                        _refundBuyOrder(order, remainingBaseAmount);
                     }
                     order.isActive = false;
                     emit OrderCancelled(orderIds[i], msg.sender);
@@ -751,14 +765,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
                     if (order.orderType == OrderType.SELL) {
                         IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
                     } else {
-                        uint256 remainingCounterpartyAmount =
-                            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
-                        if (_isETH(order.counterpartyToken)) {
-                            (bool success,) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
-                            require(success, "OTCTrading: ETH refund failed");
-                        } else {
-                            IERC20(order.counterpartyToken).safeTransfer(order.maker, remainingCounterpartyAmount);
-                        }
+                        _refundBuyOrder(order, remainingBaseAmount);
                     }
                 }
                 order.isActive = false;
