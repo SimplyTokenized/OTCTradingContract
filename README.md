@@ -1,290 +1,242 @@
 # OTC Trading Contract
 
-An upgradeable Over-The-Counter (OTC) trading contract for ERC20 tokens with configurable fees, whitelist management, and multiple counterparty token support.
+An upgradeable on-chain **Over-The-Counter (OTC)** trading contract for ERC-20 tokens. Makers post fixed-price BUY or SELL orders; takers fill them partially or fully. The contract supports configurable maker/taker fees, an optional trading whitelist, multiple counterparty tokens (including native ETH), and order expiration.
+
+> **Status:** Pre-production. This code has undergone an internal security review (see [Security](#-security)) but **has not been audited by an independent third party**. Do not deploy to mainnet with real funds until an external audit has been completed. See [DISCLAIMER](#-disclaimer).
+
+---
+
+## Table of Contents
+
+- [Features](#-features)
+- [Architecture](#-architecture)
+- [Trading Parameters](#-trading-parameters)
+- [Order Model](#-order-model)
+- [Fee Model](#-fee-model)
+- [Roles & Trust Model](#-roles--trust-model)
+- [Quick Start](#-quick-start)
+- [Deployment](#-deployment)
+- [Contract API](#-contract-api)
+- [Security](#-security)
+- [Documentation](#-documentation)
+- [Disclaimer](#-disclaimer)
+- [License](#-license)
+
+---
 
 ## ✨ Features
 
-- ✅ **Proxy Contract Support** - Fully upgradeable using OpenZeppelin's transparent proxy pattern
-- 💰 **Configurable Fees** - Maker fee (0.25% default) and Taker fee (0.5% default) in basis points
-- 📋 **Whitelist Management** - Optional whitelist requirement for trading (enabled by default)
-- 🪙 **Multiple Counterparty Tokens** - Admin can define allowed counterparty tokens (USDC as default)
-- 📊 **Order Management** - Create, fill, and cancel orders
-- ⏸️ **Pausable** - Admin can pause/unpause trading
-- 🔒 **Access Control** - Role-based access control for admin functions
-- 🛡️ **Reentrancy Protection** - Protected against reentrancy attacks
+- **Upgradeable** — OpenZeppelin transparent proxy pattern (UUPS-free, `ProxyAdmin`-controlled).
+- **BUY and SELL orders** — makers can bid for the base token or offer it for sale.
+- **Multiple counterparty tokens** — any admin-approved ERC-20, plus native **ETH** (`address(0)`).
+- **Configurable fees** — independent maker and taker fees in basis points, capped at 10% each. Fee rates are **snapshotted per order** at creation, so later fee changes never apply retroactively.
+- **Optional whitelist** — restrict trading to approved addresses.
+- **Order expiration** — optional per-deployment default expiry.
+- **Partial fills** — orders can be filled incrementally.
+- **Pausable** — admin can halt trading.
+- **Role-based access control** — separate admin and fee-recipient roles.
+- **Reentrancy-protected** — all state-changing external functions use `nonReentrant`, and settlement uses `SafeERC20`.
 
-## 📋 Trading Parameters
-
-| Parameter | Default Value | Description |
-|-----------|--------------|-------------|
-| Maker Fee | 0.25% (25 bps) | Fee charged to order creators |
-| Taker Fee | 0.5% (50 bps) | Fee charged to order fillers |
-| Minimum Order Size | 100 | Minimum base token amount for orders |
-| Require Whitelist | true | Only whitelisted addresses can trade |
+> ⚠️ **Fee-on-transfer / rebasing tokens are not supported.** The accounting assumes the contract receives exactly the amount transferred. Do not approve such tokens as base or counterparty tokens.
 
 ## 🏗️ Architecture
 
-The contract uses OpenZeppelin's transparent proxy pattern:
-- **Implementation Contract**: Contains the actual logic
-- **Proxy Contract**: Points to the implementation and stores state
-- **Proxy Admin**: Controls upgrades (has `DEFAULT_ADMIN_ROLE`)
+The system is deployed behind an OpenZeppelin **transparent proxy**:
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Proxy** | The stable address users interact with; holds all state. |
+| **Implementation** (`OTCTrading`) | Trading logic; contains no persistent state of its own. |
+| **ProxyAdmin** | A separate contract that performs upgrades. Its **owner** is the `ADMIN` address supplied at deploy time. |
+
+Upgrades are authorized by the **ProxyAdmin owner** — this is independent from the contract's internal `AccessControl` roles. See [Roles & Trust Model](#-roles--trust-model).
+
+Solidity `0.8.27`, built with [Foundry](https://book.getfoundry.sh/), `via-IR` enabled, OpenZeppelin Contracts v5.
+
+## 📋 Trading Parameters
+
+Deploy-time defaults (configurable in [`script/DeployOTC.s.sol`](script/DeployOTC.s.sol)):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Maker fee | 25 bps (0.25%) | Charged on the counterparty amount. Max 1000 bps. |
+| Taker fee | 50 bps (0.50%) | Charged on the counterparty amount. Max 1000 bps. |
+| Minimum order size | 100 | Minimum base-token amount per order (must be > 0). |
+| Maximum order size | 0 | Upper bound on base-token amount (`0` = no limit). |
+| Default order expiration | 0 | Seconds until orders expire (`0` = never). |
+| Require whitelist | true | Whether traders must be whitelisted. |
+
+## 📦 Order Model
+
+An order is created with an explicit **type**:
+
+- **`SELL` (enum value `1`)** — the maker deposits `baseTokenAmount` of the base token and wants counterparty tokens in return. The taker supplies the counterparty token and receives base tokens.
+- **`BUY` (enum value `0`)** — the maker deposits `counterpartyTokenAmount` of the counterparty token (or ETH) and wants base tokens. The taker supplies base tokens and receives the counterparty token.
+
+The price is fixed at creation as the ratio `counterpartyTokenAmount / baseTokenAmount`. Fills are settled proportionally and any dust that rounds the counterparty amount to zero is rejected.
+
+## 💰 Fee Model
+
+Both fees are computed on the **counterparty amount** of each fill, using the rates **snapshotted into the order at creation**.
+
+**SELL order** (taker pays the fee on top; maker pays it out of proceeds):
+
+```
+taker pays        = counterpartyAmount + takerFee
+maker receives    = counterpartyAmount − makerFee
+fee recipient     = makerFee + takerFee
+```
+
+**BUY order** (both fees are drawn from the maker's deposited pot, keeping the contract solvent):
+
+```
+maker deposited   = counterpartyAmount
+taker receives    = counterpartyAmount − makerFee − takerFee
+fee recipient     = makerFee + takerFee
+```
+
+**Worked example — SELL 1000 BASE for 2000 USDC, fully filled (25/50 bps):**
+
+| Party | Amount |
+|-------|--------|
+| Taker pays | 2010 USDC |
+| Maker receives | 1995 USDC |
+| Fee recipient | 15 USDC |
+
+## 🔐 Roles & Trust Model
+
+| Role | Powers |
+|------|--------|
+| **ProxyAdmin owner** | Upgrade the implementation contract. Set to the `ADMIN` address at deploy. |
+| `DEFAULT_ADMIN_ROLE` | Grant/revoke roles. |
+| `ADMIN_ROLE` | Manage fees, order limits, whitelist, counterparty tokens, pause/unpause, cleanup, and **emergency withdrawal**. |
+| `FEE_RECIPIENT_ROLE` | Informational marker for the configured fee recipient. |
+
+> **⚠️ Centralization notice.** An `ADMIN_ROLE` holder can pause trading and, **while the contract is paused**, call `emergencyWithdraw` to move any token or ETH out of the contract — including funds backing open orders. The ProxyAdmin owner can additionally replace the entire implementation. **These are powerful, trust-critical capabilities.**
+>
+> For production you should:
+> - Assign the ProxyAdmin owner and `DEFAULT_ADMIN_ROLE`/`ADMIN_ROLE` to a **multisig** and/or a **timelock**, not a single EOA. The default deploy script assigns all of them to one `ADMIN` address — change this before mainnet.
+> - Publish the custody arrangement so users can assess counterparty risk.
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-1. Install dependencies:
-```bash
-# Using npm script (recommended)
-npm run install:deps
+- [Foundry](https://book.getfoundry.sh/getting-started/installation) (`forge`, `cast`, `anvil`)
+- Node.js ≥ 18 (only for the npm convenience scripts)
 
-# Or manually with forge
-forge install OpenZeppelin/openzeppelin-contracts-upgradeable OpenZeppelin/openzeppelin-foundry-upgrades OpenZeppelin/openzeppelin-contracts
+### Install
+
+```bash
+git clone https://github.com/SimplyTokenized/OTCTradingContract.git
+cd OTCTradingContract
+forge install        # pulls submodules in lib/
 ```
 
-2. Set up environment variables in `.env`:
-```bash
-BASE_TOKEN=<address_of_erc20_token>  # The ERC20 token from ERC20 folder
-DEFAULT_COUNTERPARTY_TOKEN=<usdc_address>  # Default counterparty token (e.g., USDC)
-FEE_RECIPIENT=<address_to_receive_fees>
-ADMIN=<admin_address>
-```
-
-### Build
+### Build & test
 
 ```bash
 forge build
-```
-
-### Test
-
-```bash
-# Run all tests
-forge test
-
-# Run with gas report
+forge test            # 89 tests
 forge test --gas-report
-
-# Run with verbose output
-forge test -vv
+forge coverage        # optional
 ```
 
-### Deploy
+### Configure
+
+Copy the template and fill in real addresses:
 
 ```bash
-# Local deployment
-forge script script/DeployOTC.s.sol:DeployOTC --broadcast --rpc-url http://localhost:8545
+cp .env.example .env
+# then edit .env
+```
 
-# Testnet deployment
+`.env` is git-ignored and must never be committed. Never place private keys in `.env` for public networks — pass them via `--account`/keystore or a hardware signer at deploy time.
+
+## 📤 Deployment
+
+The deploy script reads `BASE_TOKEN`, `DEFAULT_COUNTERPARTY_TOKEN`, `FEE_RECIPIENT`, and `ADMIN` from the environment and deploys the implementation, a `ProxyAdmin`, and the transparent proxy, initializing it atomically.
+
+```bash
+# Local (Anvil) — uses the well-known public Anvil key, LOCAL USE ONLY
+npm run deploy:local
+
+# Testnet (recommended: sign with a keystore account, not a raw key)
 forge script script/DeployOTC.s.sol:DeployOTC \
-  --private-key $DEPLOYER_KEY \
-  --broadcast \
-  --verify \
-  --rpc-url $TESTNET_RPC \
-  --etherscan-api-key $ETHERSCAN_API_KEY \
-  --sender $DEPLOYER
+  --rpc-url "$TESTNET_RPC" \
+  --account deployer \
+  --sender "$DEPLOYER" \
+  --broadcast --verify --etherscan-api-key "$ETHERSCAN_API_KEY"
 ```
 
-## 📖 Contract Functions
+After deploying, **use the proxy address** for all interactions. See [`CAST_COMMANDS.md`](CAST_COMMANDS.md) for ready-to-use `cast` snippets.
 
-### Admin Functions
+### Deployed addresses
 
-#### Counterparty Token Management
-- `addCounterpartyToken(address token)` - Add an allowed counterparty token
-- `removeCounterpartyToken(address token)` - Remove a counterparty token
+| Network | Proxy | Implementation | ProxyAdmin |
+|---------|-------|----------------|------------|
+| _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 
-#### Fee Management
-- `updateFees(uint256 makerFeeBps, uint256 takerFeeBps)` - Update trading fees (max 10% each)
-- `updateFeeRecipient(address feeRecipient)` - Update fee recipient address
-
-#### Order Configuration
-- `updateMinOrderSize(uint256 minOrderSize)` - Update minimum order size
-- `updateWhitelistRequirement(bool requireWhitelist)` - Enable/disable whitelist requirement
-
-#### Whitelist Management
-- `addToWhitelist(address account)` - Add address to whitelist
-- `removeFromWhitelist(address account)` - Remove address from whitelist
-
-#### Emergency Controls
-- `pause()` - Pause all trading activities
-- `unpause()` - Resume trading activities
-
-### Trading Functions
-
-#### Order Creation
-- `createOrder(address counterpartyToken, uint256 baseTokenAmount, uint256 counterpartyTokenAmount)` 
-  - Create a new order to sell base tokens for counterparty tokens
-  - Returns: `orderId`
-
-#### Order Filling
-- `fillOrder(uint256 orderId, uint256 baseTokenAmount)` 
-  - Fill an order (partially or fully)
-  - Transfers tokens and applies fees
-
-#### Order Cancellation
-- `cancelOrder(uint256 orderId)` 
-  - Cancel an active order
-  - Returns remaining base tokens to maker
-
-### View Functions
-
-- `getOrder(uint256 orderId)` - Get complete order details
-- `getUserOrders(address user)` - Get all order IDs for a user
-- `getRemainingAmount(uint256 orderId)` - Get remaining unfilled amount
-- `allowedCounterpartyTokens(address)` - Check if token is allowed
-- `whitelist(address)` - Check if address is whitelisted
-- `makerFeeBps()` - Get maker fee in basis points
-- `takerFeeBps()` - Get taker fee in basis points
-- `minOrderSize()` - Get minimum order size
-- `requireWhitelist()` - Check if whitelist is required
-- `baseToken()` - Get base token address
-- `feeRecipient()` - Get fee recipient address
-
-## 🔐 Roles
-
-| Role | Description |
-|------|-------------|
-| `DEFAULT_ADMIN_ROLE` | Full admin access, can upgrade contract |
-| `ADMIN_ROLE` | Can manage trading parameters, whitelist, and counterparty tokens |
-| `FEE_RECIPIENT_ROLE` | Receives trading fees |
-
-## 📝 Order Flow
-
-### 1. Create Order (Maker)
-
-```
-1. User approves base tokens to OTC contract
-2. User calls createOrder(counterpartyToken, baseAmount, counterpartyAmount)
-3. Base tokens are transferred to contract
-4. Order is created and stored
-5. OrderCreated event is emitted
-```
-
-### 2. Fill Order (Taker)
-
-```
-1. User approves counterparty tokens to OTC contract
-2. User calls fillOrder(orderId, fillAmount)
-3. Contract calculates:
-   - Counterparty token amount based on order price
-   - Maker fee (from base token amount)
-   - Taker fee (from counterparty token amount)
-4. Tokens are swapped:
-   - Counterparty tokens (minus maker fee) → Maker
-   - Base tokens → Taker
-   - Fees → Fee recipient
-5. Order filled amount is updated
-6. OrderFilled event is emitted
-```
-
-### 3. Cancel Order (Maker)
-
-```
-1. Maker calls cancelOrder(orderId)
-2. Remaining base tokens are returned to maker
-3. Order is marked as inactive
-4. OrderCancelled event is emitted
-```
-
-## 💡 Example Usage
-
-### Setup
-
-```solidity
-// 1. Deploy contract (done via script)
-// 2. Admin adds USDC as counterparty token (done in initialization)
-// 3. Admin adds users to whitelist
-otc.addToWhitelist(userAddress);
-```
+## 📖 Contract API
 
 ### Trading
 
-```solidity
-// Maker creates order: sell 1000 BASE tokens for 2000 USDC
-baseToken.approve(address(otc), 1000 * 10**18);
-uint256 orderId = otc.createOrder(
-    address(usdc), 
-    1000 * 10**18,  // base token amount
-    2000 * 10**6    // counterparty token amount
-);
+| Function | Description |
+|----------|-------------|
+| `createOrder(OrderType orderType, address counterpartyToken, uint256 baseTokenAmount, uint256 counterpartyTokenAmount)` `payable` → `uint256 orderId` | Create a BUY or SELL order. For a SELL, the base token is pulled from the maker. For a BUY, the counterparty token is pulled (or ETH must be sent as `msg.value`). |
+| `fillOrder(uint256 orderId, uint256 baseTokenAmount)` `payable` | Fill an order partially or fully. |
+| `cancelOrder(uint256 orderId)` | Cancel your own order and reclaim the unfilled remainder. |
+| `batchCancelOrders(uint256[] orderIds)` | Cancel multiple of your own orders. |
 
-// Taker fills order: buy 500 BASE tokens
-// Price: 500 BASE = 1000 USDC (plus fees)
-uint256 fillAmount = 500 * 10**18;
-uint256 counterpartyAmount = 1000 * 10**6;
-uint256 takerFee = (counterpartyAmount * 50) / 10000; // 0.5%
-usdc.approve(address(otc), counterpartyAmount + takerFee);
-otc.fillOrder(orderId, fillAmount);
+### Admin (`ADMIN_ROLE`)
 
-// Maker cancels remaining order
-otc.cancelOrder(orderId);
-```
+`addCounterpartyToken` · `removeCounterpartyToken` · `updateFees` · `updateFeeRecipient` · `updateMinOrderSize` · `updateMaxOrderSize` · `updateDefaultOrderExpiration` · `updateWhitelistRequirement` · `addToWhitelist` · `removeFromWhitelist` · `batchAddToWhitelist` · `batchRemoveFromWhitelist` · `cleanupExpiredOrders` · `pause` · `unpause` · `emergencyWithdraw` *(only while paused)*
 
-## 🔄 Upgradeability
+### Views
 
-The contract uses OpenZeppelin's transparent proxy pattern:
-- **Proxy Address**: Remains constant (this is the address users interact with)
-- **Implementation**: Can be upgraded by `DEFAULT_ADMIN_ROLE`
-- **State**: Stored in proxy, persists across upgrades
+`getOrder` · `getUserOrders` · `getRemainingAmount` · `isOrderExpired` · `getActiveOrders(offset, limit)` · `getOrdersByToken(token, offset, limit)` · plus the public getters `orders`, `nextOrderId`, `makerFeeBps`, `takerFeeBps`, `minOrderSize`, `maxOrderSize`, `requireWhitelist`, `defaultOrderExpiration`, `baseToken`, `feeRecipient`, `allowedCounterpartyTokens`, `whitelist`.
 
-### Upgrade Process
+### Events
+
+`OrderCreated` · `OrderFilled` · `OrderCancelled` · `CounterpartyTokenAdded` · `CounterpartyTokenRemoved` · `WhitelistAdded` · `WhitelistRemoved` · `FeesUpdated` · `MinOrderSizeUpdated` · `MaxOrderSizeUpdated` · `DefaultOrderExpirationUpdated` · `WhitelistRequirementUpdated` · `FeeRecipientUpdated` · `OrdersCleanedUp` · `EmergencyWithdrawal`
+
+Full NatSpec-generated reference: `npm run docgen` (see [Documentation](#-documentation)).
+
+### Upgrading
 
 ```solidity
-// Only DEFAULT_ADMIN_ROLE can upgrade
-Upgrades.upgradeProxy(proxyAddress, "NewOTCTrading.sol", admin);
+// Executed by the ProxyAdmin owner
+Upgrades.upgradeProxy(proxyAddress, "OTCTradingV2.sol", "");
 ```
 
-## ⚠️ Security Considerations
+Run `Upgrades.validateUpgrade` (or `forge` with the OpenZeppelin upgrades plugin) before every upgrade to catch storage-layout incompatibilities.
 
-- ✅ **Reentrancy Protection**: All trading functions use `nonReentrant` modifier
-- ✅ **Access Control**: Admin functions protected with role checks
-- ✅ **Pausable**: Can pause trading in emergencies
-- ✅ **Whitelist**: Optional additional security layer
-- ✅ **SafeERC20**: Uses SafeERC20 for token transfers
-- ✅ **Input Validation**: All inputs are validated
-- ✅ **Order Validation**: Orders can only be filled by different addresses
+## 🛡️ Security
 
-## 📊 Fee Calculation
+- All trading entry points are `nonReentrant`; token transfers use `SafeERC20`; ETH transfers use checked low-level calls.
+- Fee rates are snapshotted per order and cannot be changed retroactively.
+- Fills that round the counterparty amount to zero are rejected.
+- `emergencyWithdraw` is gated behind `whenPaused`, so any withdrawal is preceded by a visible on-chain pause.
 
-### Maker Fee
-```
-makerFee = (counterpartyTokenAmount * makerFeeBps) / 10000
-Deducted from counterparty tokens received by maker
-Paid to fee recipient in counterparty tokens
-```
+An internal review and its remediations are documented alongside this repository. **No independent external audit has been performed yet** — commission one before mainnet deployment.
 
-### Taker Fee
-```
-takerFee = (counterpartyTokenAmount * takerFeeBps) / 10000
-Paid by taker in addition to counterparty token amount
-```
-
-### Example
-- Order: 1000 BASE for 2000 USDC
-- Maker fee: 0.25% = 5 USDC
-- Taker fee: 0.5% = 10 USDC
-- Maker receives: 1995 USDC
-- Taker pays: 2010 USDC
-- Fee recipient receives: 15 USDC total
-
-## 🧪 Testing
-
-See `CAST_COMMANDS.md` for detailed cast commands to test the contract.
+To report a vulnerability, follow [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
 
 ## 📚 Documentation
 
-Auto-generated API documentation from NatSpec comments is available in the `docs/` directory. Generate it with:
+Generate the NatSpec API reference locally:
 
 ```bash
-npm run docgen
+npm run docgen         # writes to docs/
+npm run docgen:serve   # build and serve, opens in browser
 ```
 
-Or generate and serve it locally (opens in browser automatically):
+The `docs/` output is generated and git-ignored.
 
-```bash
-npm run docgen:serve
-```
+## ⚖️ Disclaimer
+
+This software is provided "as is", without warranty of any kind. It has not been audited by an independent third party. Deploying or interacting with these contracts is at your own risk, and the authors accept no liability for any loss of funds. Nothing here is financial, legal, or investment advice.
 
 ## 📄 License
 
-MIT
+[MIT](LICENSE) © SimplyTokenized

@@ -38,18 +38,7 @@ contract DeployOTC is Script {
             admin, // Proxy admin
             abi.encodeCall(
                 OTCTrading.initialize,
-                (
-                    baseToken,
-                    defaultCounterpartyToken,
-                    feeRecipient,
-                    admin,
-                    25,
-                    50,
-                    100,
-                    0,
-                    0,
-                    true
-                )
+                (baseToken, defaultCounterpartyToken, feeRecipient, admin, 25, 50, 100, 0, 0, true)
             )
         );
 

@@ -47,19 +47,7 @@ contract OTCTradingTest is Test {
             "OTCTrading.sol",
             admin,
             abi.encodeCall(
-                OTCTrading.initialize,
-                (
-                    address(baseToken),
-                    address(usdc),
-                    feeRecipient,
-                    admin,
-                    25,
-                    50,
-                    100,
-                    0,
-                    0,
-                    true
-                )
+                OTCTrading.initialize, (address(baseToken), address(usdc), feeRecipient, admin, 25, 50, 100, 0, 0, true)
             )
         );
 
@@ -266,7 +254,7 @@ contract OTCTradingTest is Test {
         assertEq(order.baseTokenAmount, baseAmount);
         assertEq(order.counterpartyTokenAmount, ethAmount);
         assertTrue(order.isActive);
-        
+
         // Check ETH was deposited
         assertEq(user1.balance, user1BalanceBefore - ethAmount);
         assertEq(address(otc).balance, ethAmount);
@@ -338,12 +326,7 @@ contract OTCTradingTest is Test {
         // Create BUY order (user1 buys base tokens with ETH)
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
-        uint256 orderId = otc.createOrder{value: ethAmount}(
-            OTCTrading.OrderType.BUY,
-            address(0),
-            baseAmount,
-            ethAmount
-        );
+        uint256 orderId = otc.createOrder{value: ethAmount}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
         vm.stopPrank();
 
         // Fill order (user2 sells base tokens for ETH)
@@ -363,7 +346,9 @@ contract OTCTradingTest is Test {
 
         // Check balances
         assertEq(baseToken.balanceOf(user1), user1BaseBefore + fillAmount);
-        assertEq(user2.balance, user2EthBefore + expectedEthAmount - takerFee);
+        // BUY settlement now deducts BOTH fees from the maker-funded pot so the
+        // contract stays solvent; taker receives amount - takerFee - makerFee.
+        assertEq(user2.balance, user2EthBefore + expectedEthAmount - takerFee - makerFee);
         assertEq(feeRecipient.balance, feeRecipientEthBefore + makerFee + takerFee);
     }
 
@@ -379,12 +364,7 @@ contract OTCTradingTest is Test {
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
         uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount}(
-            OTCTrading.OrderType.BUY,
-            address(0),
-            baseAmount,
-            ethAmount
-        );
+        uint256 orderId = otc.createOrder{value: ethAmount}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
         otc.cancelOrder(orderId);
         vm.stopPrank();
 
@@ -405,12 +385,7 @@ contract OTCTradingTest is Test {
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
         vm.expectRevert("OTCTrading: incorrect ETH amount");
-        otc.createOrder{value: ethAmount + 1 ether}(
-            OTCTrading.OrderType.BUY,
-            address(0),
-            baseAmount,
-            ethAmount
-        );
+        otc.createOrder{value: ethAmount + 1 ether}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
         vm.stopPrank();
     }
 
@@ -488,7 +463,9 @@ contract OTCTradingTest is Test {
 
         // Check balances
         assertEq(baseToken.balanceOf(user1), user1BaseBefore + fillAmount);
-        assertEq(usdc.balanceOf(user2), user2UsdcBefore + expectedUsdcAmount - takerFee);
+        // BUY settlement now deducts BOTH fees from the maker-funded pot so the
+        // contract stays solvent; taker receives amount - takerFee - makerFee.
+        assertEq(usdc.balanceOf(user2), user2UsdcBefore + expectedUsdcAmount - takerFee - makerFee);
         assertEq(usdc.balanceOf(feeRecipient), feeRecipientUsdcBefore + makerFee + takerFee);
     }
 
@@ -1174,12 +1151,7 @@ contract OTCTradingTest is Test {
         vm.startPrank(user1);
         vm.deal(user1, 10 ether);
         uint256 user1BalanceBefore = user1.balance;
-        uint256 orderId = otc.createOrder{value: ethAmount}(
-            OTCTrading.OrderType.BUY,
-            address(0),
-            baseAmount,
-            ethAmount
-        );
+        uint256 orderId = otc.createOrder{value: ethAmount}(OTCTrading.OrderType.BUY, address(0), baseAmount, ethAmount);
         vm.stopPrank();
 
         // Fast forward time
@@ -1212,6 +1184,8 @@ contract OTCTradingTest is Test {
         uint256 recipientBalanceBefore = baseToken.balanceOf(recipient);
 
         vm.prank(admin);
+        otc.pause(); // emergencyWithdraw is only callable while paused
+        vm.prank(admin);
         otc.emergencyWithdraw(address(baseToken), recipient, 0); // 0 = withdraw all
 
         assertEq(baseToken.balanceOf(recipient), recipientBalanceBefore + stuckAmount);
@@ -1224,6 +1198,8 @@ contract OTCTradingTest is Test {
         address recipient = address(0x999);
         uint256 recipientBalanceBefore = recipient.balance;
 
+        vm.prank(admin);
+        otc.pause(); // emergencyWithdraw is only callable while paused
         vm.prank(admin);
         otc.emergencyWithdraw(address(0), recipient, 0); // 0 = withdraw all
 
@@ -1239,6 +1215,8 @@ contract OTCTradingTest is Test {
         address recipient = address(0x999);
         uint256 withdrawAmount = 500 * 10 ** baseToken.decimals();
 
+        vm.prank(admin);
+        otc.pause(); // emergencyWithdraw is only callable while paused
         vm.prank(admin);
         otc.emergencyWithdraw(address(baseToken), recipient, withdrawAmount);
 
@@ -1633,7 +1611,7 @@ contract OTCTradingTest is Test {
 
     function test_EmergencyWithdrawExceedsBalance() public {
         uint256 stuckAmount = 1000 * 10 ** baseToken.decimals();
-        
+
         // Send some tokens to contract
         vm.startPrank(user1);
         baseToken.transfer(address(otc), stuckAmount);
@@ -1643,16 +1621,20 @@ contract OTCTradingTest is Test {
         uint256 withdrawAmount = stuckAmount + 1; // More than balance
 
         vm.prank(admin);
+        otc.pause(); // emergencyWithdraw is only callable while paused
+        vm.prank(admin);
         vm.expectRevert("OTCTrading: insufficient balance");
         otc.emergencyWithdraw(address(baseToken), recipient, withdrawAmount);
     }
 
     function test_EmergencyWithdrawETHExceedsBalance() public {
         vm.deal(address(otc), 5 ether);
-        
+
         address recipient = address(0x999);
         uint256 withdrawAmount = 6 ether; // More than balance
 
+        vm.prank(admin);
+        otc.pause(); // emergencyWithdraw is only callable while paused
         vm.prank(admin);
         vm.expectRevert("OTCTrading: insufficient balance");
         otc.emergencyWithdraw(address(0), recipient, withdrawAmount);
@@ -1662,7 +1644,7 @@ contract OTCTradingTest is Test {
         // Set max order size first
         vm.prank(admin);
         otc.updateMaxOrderSize(5000);
-        
+
         // Try to set min order size above max (should fail)
         vm.prank(admin);
         vm.expectRevert("OTCTrading: min exceeds max");
@@ -1795,7 +1777,7 @@ contract OTCTradingTest is Test {
     function test_GetOrderNonExistent() public {
         // Get order with non-existent order ID
         OTCTrading.Order memory order = otc.getOrder(99999);
-        
+
         // Should return default Order struct
         assertEq(order.id, 0);
         assertEq(order.maker, address(0));
@@ -1824,5 +1806,96 @@ contract OTCTradingTest is Test {
         (uint256[] memory orderIds, uint256 total) = otc.getActiveOrders(0, 10);
         assertEq(total, 0);
         assertEq(orderIds.length, 0);
+    }
+
+    // ============ Security regression tests ============
+
+    /// Fully filling a BUY order must not disburse more counterparty token than
+    /// the maker deposited. Regression for the fee-accounting insolvency bug.
+    function test_Security_BuyOrderStaysSolvent() public {
+        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
+        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
+
+        // Maker funds exactly usdcAmount.
+        vm.startPrank(user1);
+        usdc.approve(address(otc), usdcAmount);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.BUY, address(usdc), baseAmount, usdcAmount);
+        vm.stopPrank();
+
+        uint256 contractBefore = usdc.balanceOf(address(otc));
+        assertEq(contractBefore, usdcAmount);
+
+        // Taker fully fills.
+        vm.startPrank(user2);
+        baseToken.approve(address(otc), baseAmount);
+        otc.fillOrder(id, baseAmount);
+        vm.stopPrank();
+
+        // The order's entire pot is consumed and nothing more: the contract's
+        // USDC balance returns to its pre-order level (zero here).
+        assertEq(usdc.balanceOf(address(otc)), 0, "BUY fill overspent the pot");
+
+        // Sum of outflows equals exactly what the maker deposited.
+        uint256 makerFee = (usdcAmount * otc.makerFeeBps()) / 10000;
+        uint256 takerFee = (usdcAmount * otc.takerFeeBps()) / 10000;
+        assertEq(usdc.balanceOf(user2), (usdcAmount - makerFee - takerFee) + 100000 * 10 ** usdc.decimals());
+        assertEq(usdc.balanceOf(feeRecipient), makerFee + takerFee);
+    }
+
+    /// A fill whose computed counterparty amount rounds down to zero must revert.
+    function test_Security_RoundingToZeroReverts() public {
+        // SELL 1e18 base for 1 wei counterparty (passes creation price check).
+        uint256 baseAmount = 1e18;
+        vm.startPrank(user1);
+        baseToken.mint(user1, baseAmount);
+        baseToken.approve(address(otc), baseAmount);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, 1);
+        vm.stopPrank();
+
+        // Filling 1e17 base -> counterparty = 1e17 * 1 / 1e18 = 0. Must revert.
+        vm.startPrank(user2);
+        vm.expectRevert("OTCTrading: amount rounds to zero");
+        otc.fillOrder(id, 1e17);
+        vm.stopPrank();
+    }
+
+    /// Fees are snapshotted at order creation; a later admin fee change must not
+    /// apply retroactively to an order already on the book.
+    function test_Security_FeesAreSnapshotted() public {
+        uint256 baseAmount = 1000 * 10 ** baseToken.decimals();
+        uint256 usdcAmount = 2000 * 10 ** usdc.decimals();
+
+        vm.startPrank(user1);
+        baseToken.approve(address(otc), baseAmount);
+        uint256 id = otc.createOrder(OTCTrading.OrderType.SELL, address(usdc), baseAmount, usdcAmount);
+        vm.stopPrank();
+
+        OTCTrading.Order memory order = otc.getOrder(id);
+        assertEq(order.makerFeeBps, 25);
+        assertEq(order.takerFeeBps, 50);
+
+        // Admin raises fees to the maximum after the order exists.
+        vm.prank(admin);
+        otc.updateFees(1000, 1000);
+
+        // Fill should use the snapshotted 25/50 bps, not the new 1000/1000.
+        uint256 makerFee = (usdcAmount * 25) / 10000;
+        uint256 takerFee = (usdcAmount * 50) / 10000;
+        uint256 feeRecipientBefore = usdc.balanceOf(feeRecipient);
+
+        vm.startPrank(user2);
+        usdc.approve(address(otc), usdcAmount + takerFee);
+        otc.fillOrder(id, baseAmount);
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(feeRecipient), feeRecipientBefore + makerFee + takerFee);
+    }
+
+    /// emergencyWithdraw must be blocked unless the contract is paused.
+    function test_Security_EmergencyWithdrawRequiresPause() public {
+        vm.deal(address(otc), 1 ether);
+        vm.prank(admin);
+        vm.expectRevert(); // ExpectedPause()
+        otc.emergencyWithdraw(address(0), address(0x999), 0);
     }
 }

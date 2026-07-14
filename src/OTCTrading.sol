@@ -11,7 +11,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /**
  * @title OTCTrading
  * @dev Over-The-Counter trading contract for ERC20 tokens with configurable fees, whitelist, and counterparty tokens
- * 
+ *
  * @notice IMPORTANT: This contract does NOT support fee-on-transfer tokens.
  * Fee-on-transfer tokens (tokens that charge a fee on transfer like PAXG, some USDT implementations)
  * will cause accounting issues because the contract receives less tokens than expected.
@@ -43,8 +43,8 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
 
     // Order type enum
     enum OrderType {
-        BUY,  // Buying base tokens with counterparty tokens
-        SELL  // Selling base tokens for counterparty tokens
+        BUY, // Buying base tokens with counterparty tokens
+        SELL // Selling base tokens for counterparty tokens
     }
 
     // Order structure
@@ -59,6 +59,10 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
         bool isActive;
         uint256 createdAt;
         uint256 expiresAt; // Expiration timestamp (0 = no expiration)
+        // Fee rates snapshotted at creation so later admin fee changes cannot be
+        // applied retroactively to orders that are already on the book.
+        uint256 makerFeeBps;
+        uint256 takerFeeBps;
     }
 
     // Order management
@@ -351,7 +355,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
         require(baseTokenAmount >= minOrderSize, "OTCTrading: order size below minimum");
         require(maxOrderSize == 0 || baseTokenAmount <= maxOrderSize, "OTCTrading: order size above maximum");
         require(counterpartyTokenAmount > 0, "OTCTrading: invalid counterparty amount");
-        
+
         // Price validation: prevent zero-price or extremely skewed prices
         // Price must be reasonable (not zero and not more than 10^18 ratio)
         require(counterpartyTokenAmount * 1e18 / baseTokenAmount >= 1, "OTCTrading: price too low");
@@ -390,7 +394,9 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             filledAmount: 0,
             isActive: true,
             createdAt: block.timestamp,
-            expiresAt: expirationTime
+            expiresAt: expirationTime,
+            makerFeeBps: makerFeeBps,
+            takerFeeBps: takerFeeBps
         });
 
         userOrders[msg.sender].push(orderId);
@@ -421,48 +427,51 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
         // For standard order sizes, this precision loss is negligible
         uint256 counterpartyTokenAmount = (baseTokenAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
 
+        // Reject fills whose settlement rounds down to zero counterparty tokens.
+        // Without this, a taker could repeatedly claim base tokens while paying
+        // nothing (SELL) or drain the maker's deposit (BUY) via rounding dust.
+        require(counterpartyTokenAmount > 0, "OTCTrading: amount rounds to zero");
+
         if (order.orderType == OrderType.SELL) {
             // SELL order: Maker is selling base tokens for counterparty tokens
             // Maker has base tokens in contract, wants counterparty tokens
             // Taker provides counterparty tokens, receives base tokens
 
-            // Calculate fees on counterparty tokens
-            uint256 makerFee = (counterpartyTokenAmount * makerFeeBps) / 10000;
-            uint256 takerFee = (counterpartyTokenAmount * takerFeeBps) / 10000;
+            // Calculate fees on counterparty tokens using the order's snapshotted rates
+            uint256 makerFee = (counterpartyTokenAmount * order.makerFeeBps) / 10000;
+            uint256 takerFee = (counterpartyTokenAmount * order.takerFeeBps) / 10000;
 
             if (_isETH(order.counterpartyToken)) {
                 // ETH counterparty: taker sends ETH
                 require(msg.value >= counterpartyTokenAmount + takerFee, "OTCTrading: insufficient ETH sent");
-                
+
                 // Refund excess ETH if any
                 if (msg.value > counterpartyTokenAmount + takerFee) {
-                    (bool refundSuccess, ) = payable(msg.sender).call{value: msg.value - counterpartyTokenAmount - takerFee}("");
+                    (bool refundSuccess,) =
+                        payable(msg.sender).call{value: msg.value - counterpartyTokenAmount - takerFee}("");
                     require(refundSuccess, "OTCTrading: ETH refund failed");
                 }
 
                 // Transfer ETH to maker (minus maker fee)
-                (bool makerSuccess, ) = payable(order.maker).call{value: counterpartyTokenAmount - makerFee}("");
+                (bool makerSuccess,) = payable(order.maker).call{value: counterpartyTokenAmount - makerFee}("");
                 require(makerSuccess, "OTCTrading: ETH transfer to maker failed");
 
                 // Transfer fees to fee recipient
                 if (makerFee > 0) {
-                    (bool makerFeeSuccess, ) = payable(feeRecipient).call{value: makerFee}("");
+                    (bool makerFeeSuccess,) = payable(feeRecipient).call{value: makerFee}("");
                     require(makerFeeSuccess, "OTCTrading: ETH fee transfer failed");
                 }
                 if (takerFee > 0) {
-                    (bool takerFeeSuccess, ) = payable(feeRecipient).call{value: takerFee}("");
+                    (bool takerFeeSuccess,) = payable(feeRecipient).call{value: takerFee}("");
                     require(takerFeeSuccess, "OTCTrading: ETH fee transfer failed");
                 }
             } else {
                 // ERC20 counterparty
                 require(msg.value == 0, "OTCTrading: ETH not needed for ERC20 token");
-                
+
                 // Transfer counterparty tokens from taker (including taker fee)
-                IERC20(order.counterpartyToken).safeTransferFrom(
-                    msg.sender,
-                    address(this),
-                    counterpartyTokenAmount + takerFee
-                );
+                IERC20(order.counterpartyToken)
+                    .safeTransferFrom(msg.sender, address(this), counterpartyTokenAmount + takerFee);
 
                 // Transfer counterparty tokens to maker (minus maker fee)
                 IERC20(order.counterpartyToken).safeTransfer(order.maker, counterpartyTokenAmount - makerFee);
@@ -485,9 +494,13 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             // Maker has counterparty tokens in contract, wants base tokens
             // Taker provides base tokens, receives counterparty tokens
 
-            // Calculate fees on counterparty tokens
-            uint256 makerFee = (counterpartyTokenAmount * makerFeeBps) / 10000;
-            uint256 takerFee = (counterpartyTokenAmount * takerFeeBps) / 10000;
+            // Calculate fees on counterparty tokens using the order's snapshotted rates.
+            // The maker funded exactly `counterpartyTokenAmount` at creation, so both
+            // fees are drawn from that settlement pot (taker receives the remainder).
+            // This keeps total disbursement == amount deposited and the contract solvent.
+            uint256 makerFee = (counterpartyTokenAmount * order.makerFeeBps) / 10000;
+            uint256 takerFee = (counterpartyTokenAmount * order.takerFeeBps) / 10000;
+            uint256 takerProceeds = counterpartyTokenAmount - makerFee - takerFee;
 
             // Transfer base tokens from taker
             require(msg.value == 0, "OTCTrading: ETH not needed");
@@ -496,30 +509,25 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             // Transfer base tokens to maker
             IERC20(baseToken).safeTransfer(order.maker, baseTokenAmount);
 
+            uint256 totalFee = makerFee + takerFee;
+
             if (_isETH(order.counterpartyToken)) {
-                // ETH counterparty: transfer ETH to taker (minus taker fee)
-                (bool takerSuccess, ) = payable(msg.sender).call{value: counterpartyTokenAmount - takerFee}("");
+                // ETH counterparty: transfer ETH to taker (minus both fees)
+                (bool takerSuccess,) = payable(msg.sender).call{value: takerProceeds}("");
                 require(takerSuccess, "OTCTrading: ETH transfer to taker failed");
 
                 // Transfer fees to fee recipient (from ETH held by contract)
-                if (makerFee > 0) {
-                    (bool makerFeeSuccess, ) = payable(feeRecipient).call{value: makerFee}("");
-                    require(makerFeeSuccess, "OTCTrading: ETH fee transfer failed");
-                }
-                if (takerFee > 0) {
-                    (bool takerFeeSuccess, ) = payable(feeRecipient).call{value: takerFee}("");
-                    require(takerFeeSuccess, "OTCTrading: ETH fee transfer failed");
+                if (totalFee > 0) {
+                    (bool feeSuccess,) = payable(feeRecipient).call{value: totalFee}("");
+                    require(feeSuccess, "OTCTrading: ETH fee transfer failed");
                 }
             } else {
-                // ERC20 counterparty: transfer to taker (minus taker fee)
-                IERC20(order.counterpartyToken).safeTransfer(msg.sender, counterpartyTokenAmount - takerFee);
+                // ERC20 counterparty: transfer to taker (minus both fees)
+                IERC20(order.counterpartyToken).safeTransfer(msg.sender, takerProceeds);
 
                 // Transfer fees to fee recipient (from counterparty tokens held by contract)
-                if (makerFee > 0) {
-                    IERC20(order.counterpartyToken).safeTransfer(feeRecipient, makerFee);
-                }
-                if (takerFee > 0) {
-                    IERC20(order.counterpartyToken).safeTransfer(feeRecipient, takerFee);
+                if (totalFee > 0) {
+                    IERC20(order.counterpartyToken).safeTransfer(feeRecipient, totalFee);
                 }
             }
 
@@ -550,9 +558,10 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
             IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
         } else {
             // BUY order: return remaining counterparty tokens to maker
-            uint256 remainingCounterpartyAmount = (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
+            uint256 remainingCounterpartyAmount =
+                (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
             if (_isETH(order.counterpartyToken)) {
-                (bool success, ) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
+                (bool success,) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
                 require(success, "OTCTrading: ETH refund failed");
             } else {
                 IERC20(order.counterpartyToken).safeTransfer(order.maker, remainingCounterpartyAmount);
@@ -621,9 +630,13 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
      * @return orderIds Array of active order IDs
      * @return total Total number of active orders
      */
-    function getActiveOrders(uint256 offset, uint256 limit) external view returns (uint256[] memory orderIds, uint256 total) {
+    function getActiveOrders(uint256 offset, uint256 limit)
+        external
+        view
+        returns (uint256[] memory orderIds, uint256 total)
+    {
         require(limit > 0 && limit <= 100, "OTCTrading: invalid limit");
-        
+
         // Count total active orders
         uint256 count = 0;
         for (uint256 i = 1; i < nextOrderId; i++) {
@@ -635,7 +648,7 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
 
         uint256 resultCount = count > offset ? (count - offset > limit ? limit : count - offset) : 0;
         orderIds = new uint256[](resultCount);
-        
+
         uint256 index = 0;
         uint256 found = 0;
         for (uint256 i = 1; i < nextOrderId && found < resultCount + offset; i++) {
@@ -659,13 +672,17 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
      * @param limit Maximum number of orders to return
      * @return orderIds Array of order IDs
      */
-    function getOrdersByToken(address counterpartyToken, uint256 offset, uint256 limit) external view returns (uint256[] memory orderIds) {
+    function getOrdersByToken(address counterpartyToken, uint256 offset, uint256 limit)
+        external
+        view
+        returns (uint256[] memory orderIds)
+    {
         require(limit > 0 && limit <= 100, "OTCTrading: invalid limit");
-        
+
         uint256[] memory tempOrders = new uint256[](limit);
         uint256 count = 0;
         uint256 found = 0;
-        
+
         for (uint256 i = 1; i < nextOrderId && count < limit; i++) {
             Order memory order = orders[i];
             if (order.counterpartyToken == counterpartyToken && order.isActive) {
@@ -698,9 +715,10 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
                     if (order.orderType == OrderType.SELL) {
                         IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
                     } else {
-                        uint256 remainingCounterpartyAmount = (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
+                        uint256 remainingCounterpartyAmount =
+                            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
                         if (_isETH(order.counterpartyToken)) {
-                            (bool success, ) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
+                            (bool success,) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
                             require(success, "OTCTrading: ETH refund failed");
                         } else {
                             IERC20(order.counterpartyToken).safeTransfer(order.maker, remainingCounterpartyAmount);
@@ -718,7 +736,12 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
      * @param orderIds Array of order IDs to cleanup
      * @return cleanedCount Number of orders cleaned up
      */
-    function cleanupExpiredOrders(uint256[] calldata orderIds) external onlyRole(ADMIN_ROLE) nonReentrant returns (uint256 cleanedCount) {
+    function cleanupExpiredOrders(uint256[] calldata orderIds)
+        external
+        onlyRole(ADMIN_ROLE)
+        nonReentrant
+        returns (uint256 cleanedCount)
+    {
         uint256 cleaned = 0;
         for (uint256 i = 0; i < orderIds.length; i++) {
             Order storage order = orders[orderIds[i]];
@@ -728,9 +751,10 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
                     if (order.orderType == OrderType.SELL) {
                         IERC20(baseToken).safeTransfer(order.maker, remainingBaseAmount);
                     } else {
-                        uint256 remainingCounterpartyAmount = (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
+                        uint256 remainingCounterpartyAmount =
+                            (remainingBaseAmount * order.counterpartyTokenAmount) / order.baseTokenAmount;
                         if (_isETH(order.counterpartyToken)) {
-                            (bool success, ) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
+                            (bool success,) = payable(order.maker).call{value: remainingCounterpartyAmount}("");
                             require(success, "OTCTrading: ETH refund failed");
                         } else {
                             IERC20(order.counterpartyToken).safeTransfer(order.maker, remainingCounterpartyAmount);
@@ -750,15 +774,22 @@ contract OTCTrading is Initializable, AccessControlUpgradeable, ReentrancyGuardU
      * @param token Token address (address(0) for ETH)
      * @param to Recipient address
      * @param amount Amount to withdraw (0 = all balance)
+     * @notice Only callable while the contract is paused, so an emergency
+     * withdrawal is always preceded by a visible on-chain pause.
      */
-    function emergencyWithdraw(address token, address to, uint256 amount) external onlyRole(ADMIN_ROLE) nonReentrant {
+    function emergencyWithdraw(address token, address to, uint256 amount)
+        external
+        onlyRole(ADMIN_ROLE)
+        nonReentrant
+        whenPaused
+    {
         require(to != address(0), "OTCTrading: invalid recipient");
-        
+
         if (_isETH(token)) {
             uint256 balance = address(this).balance;
             uint256 withdrawAmount = amount == 0 ? balance : amount;
             require(withdrawAmount <= balance, "OTCTrading: insufficient balance");
-            (bool success, ) = payable(to).call{value: withdrawAmount}("");
+            (bool success,) = payable(to).call{value: withdrawAmount}("");
             require(success, "OTCTrading: ETH transfer failed");
             emit EmergencyWithdrawal(token, to, withdrawAmount);
         } else {

@@ -1,6 +1,14 @@
 # Cast Commands for OTC Trading Contract
 
-This document contains all the `cast` commands to interact with and test the OTC Trading contract.
+This document contains `cast` commands to interact with and test the OTC Trading contract.
+
+> ⚠️ **The private keys in this document are the well-known, publicly published Anvil/Foundry
+> development keys.** They are intended for **local testing only**. They control no real funds and
+> must **never** be used on a public testnet or mainnet. On live networks, sign with a keystore
+> account (`--account <name>`) or a hardware wallet — never paste a raw private key.
+>
+> **Interface note:** `createOrder` takes an `OrderType` as its first argument
+> (`0` = BUY, `1` = SELL). All examples below use `1` (SELL) unless noted.
 
 ## Prerequisites
 
@@ -96,14 +104,14 @@ cast call $OTC_ADDRESS "paused()(bool)" --rpc-url $RPC_URL
 
 ### Get Order Details
 ```bash
-cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,address,uint256,uint256,uint256,bool,uint256)" <ORDER_ID> --rpc-url $RPC_URL
+cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,uint8,address,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256)" <ORDER_ID> --rpc-url $RPC_URL
 ```
 
-**Note:** The return values are: `(id, maker, counterpartyToken, baseTokenAmount, counterpartyTokenAmount, filledAmount, isActive, createdAt)`
+**Note:** The return values are: `(id, maker, orderType, counterpartyToken, baseTokenAmount, counterpartyTokenAmount, filledAmount, isActive, createdAt, expiresAt, makerFeeBps, takerFeeBps)` where `orderType` is `0` = BUY, `1` = SELL.
 
 **Example:**
 ```bash
-cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,address,uint256,uint256,uint256,bool,uint256)" 1 --rpc-url $RPC_URL
+cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,uint8,address,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256)" 1 --rpc-url $RPC_URL
 ```
 
 ### Get Remaining Amount in Order
@@ -143,22 +151,37 @@ cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS <AMOUNT> --private
 cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS 1000000000000000000000 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
 
-Then create the order:
+Then create the order (first argument is the order type: `0` = BUY, `1` = SELL):
 ```bash
-cast send $OTC_ADDRESS "createOrder(address,uint256,uint256)" \
+cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
+  <ORDER_TYPE> \
   <COUNTERPARTY_TOKEN> \
   <BASE_TOKEN_AMOUNT> \
   <COUNTERPARTY_TOKEN_AMOUNT> \
   --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
 
-**Example:**
+**Example (SELL):**
 ```bash
-# Create order: sell 1000 BASE tokens for 2000 USDC (assuming 6 decimals for USDC)
-cast send $OTC_ADDRESS "createOrder(address,uint256,uint256)" \
+# SELL order: sell 1000 BASE tokens for 2000 USDC (assuming 6 decimals for USDC)
+cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
+  1 \
   $COUNTERPARTY_TOKEN \
   1000000000000000000000 \
   2000000000 \
+  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+```
+
+**Example (BUY with ETH counterparty):**
+```bash
+# BUY order: buy 1000 BASE tokens for 2 ETH. ETH is sent as value.
+# Requires ETH (address(0)) to be an allowed counterparty token.
+cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
+  0 \
+  0x0000000000000000000000000000000000000000 \
+  1000000000000000000000 \
+  2000000000000000000 \
+  --value 2000000000000000000 \
   --private-key $PRIVATE_KEY --rpc-url $RPC_URL
 ```
 
@@ -365,15 +388,16 @@ cast call $OTC_ADDRESS "allowedCounterpartyTokens(address)(bool)" $COUNTERPARTY_
 cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS 1000000000000000000000 \
   --private-key $USER1_KEY --rpc-url $RPC_URL
 
-# Create order: 1000 BASE for 2000 USDC
-cast send $OTC_ADDRESS "createOrder(address,uint256,uint256)" \
+# Create SELL order: sell 1000 BASE for 2000 USDC (order type 1 = SELL)
+cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
+  1 \
   $COUNTERPARTY_TOKEN \
   1000000000000000000000 \
   2000000000 \
   --private-key $USER1_KEY --rpc-url $RPC_URL
 
 # 7. Get order details
-cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,address,uint256,uint256,uint256,bool,uint256)" \
+cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,uint8,address,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256)" \
   1 --rpc-url $RPC_URL
 
 # 8. Fill order (as ADMIN)
@@ -455,7 +479,7 @@ cast balance <ADDRESS> --rpc-url $RPC_URL
 
 ### Monitor OrderCreated events
 ```bash
-cast logs --from-block 0 "OrderCreated(uint256,address,address,uint256,uint256)" --rpc-url $RPC_URL
+cast logs --from-block 0 "OrderCreated(uint256,address,uint8,address,uint256,uint256)" --rpc-url $RPC_URL
 ```
 
 ### Monitor OrderFilled events
@@ -476,9 +500,12 @@ cast logs --from-block 0 "OrderCancelled(uint256,address)" --rpc-url $RPC_URL
 - For tokens with 18 decimals: 1 token = 1000000000000000000 wei
 - For USDC (6 decimals): 1 USDC = 1000000
 - Always approve tokens before creating or filling orders
-- Taker fee is paid in addition to the counterparty token amount
-- Maker fee is deducted from the counterparty tokens received
+- Order type is the first `createOrder` argument: `0` = BUY, `1` = SELL
+- **SELL orders:** the taker pays `counterpartyAmount + takerFee`; the maker receives `counterpartyAmount − makerFee`
+- **BUY orders:** the taker receives `counterpartyAmount − makerFee − takerFee` from the maker's deposited pot
+- Fee rates are snapshotted per order at creation and are not affected by later `updateFees` calls
 - Orders can be filled partially or fully
 - Only the order maker can cancel their order
+- `emergencyWithdraw` can only be called while the contract is paused
 - When using testnet, replace `$RPC_URL` with your testnet RPC URL and use appropriate private keys
 - Always verify you have the required role before attempting admin operations

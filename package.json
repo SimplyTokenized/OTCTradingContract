@@ -34,8 +34,19 @@
     "foundry",
     "defi"
   ],
-  "author": "",
+  "author": "SimplyTokenized",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SimplyTokenized/OTCTradingContract.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SimplyTokenized/OTCTradingContract/issues"
+  },
+  "homepage": "https://github.com/SimplyTokenized/OTCTradingContract#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
     "@types/node": "^20.0.0"
   }

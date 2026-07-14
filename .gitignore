@@ -11,5 +11,13 @@ lib/
 # Docs
 docs/
 
-# Dotenv file
+# Dotenv files (never commit real secrets; .env.example is the tracked template)
 .env
+.env.*
+!.env.example
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
