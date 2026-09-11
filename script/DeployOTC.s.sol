@@ -7,52 +7,49 @@ import {Upgrades} from "@openzeppelin-foundry-upgrades/Upgrades.sol";
 
 /**
  * @title DeployOTC
- * @dev Deployment script for OTC Trading contract with proxy
+ * @notice Deploy ONE trading contract for a tenant. Offerings are listed afterwards, one call each
+ * — see {CreateOffering}.
+ *
+ * @dev v1 deployed a contract per instrument, so this script took a base token. v2 does not: the
+ * contract knows nothing about any instrument until an operator lists one, which is what lets a
+ * tenant add their fortieth offering without a fortieth deployment, a fortieth upgrade path and a
+ * fortieth set of keys to guard.
+ *
+ * Required environment: ADMIN, APPROVER, UPGRADER.
+ * Optional: TRUSTED_FORWARDER (ERC-2771 relaying; omit for "users pay their own gas").
  */
 contract DeployOTC is Script {
     function run() public returns (OTCTrading otc) {
+        address admin = vm.envAddress("ADMIN");
+        address approver = vm.envAddress("APPROVER");
+        address upgrader = vm.envAddress("UPGRADER");
+        address forwarder = vm.envOr("TRUSTED_FORWARDER", address(0));
+
+        require(approver != admin, "DeployOTC: APPROVER must differ from ADMIN");
+
+        console.log("Deploying OTCTrading (one contract, many offerings)...");
+        console.log("Admin     :", admin);
+        console.log("Approver  :", approver);
+        console.log("Upgrader  :", upgrader);
+        console.log("Forwarder :", forwarder);
+
         vm.startBroadcast();
 
-        // Get deployment parameters from environment
-        address baseToken = vm.envAddress("BASE_TOKEN");
-        address defaultCounterpartyToken = vm.envAddress("DEFAULT_COUNTERPARTY_TOKEN"); // e.g., USDC
-        address feeRecipient = vm.envAddress("FEE_RECIPIENT");
-        address admin = vm.envAddress("ADMIN");
-
-        console.log("Deploying OTC Trading contract with proxy...");
-        console.log("Base Token:", baseToken);
-        console.log("Default Counterparty Token:", defaultCounterpartyToken);
-        console.log("Fee Recipient:", feeRecipient);
-        console.log("Admin:", admin);
-
-        // Deploy UUPS proxy. Upgrades are authorized by UPGRADER_ROLE on the implementation
-        // (granted to `admin` at init) — move that role to a Timelock + multisig for production.
-        // NOTE: These initial economic parameters should be wired from your UI/config
-        // if you want them to be dynamic. For now we use the same defaults
-        // as the original implementation:
-        // makerFeeBps = 25 (0.25%), takerFeeBps = 50 (0.5%),
-        // minOrderSize = 100, maxOrderSize = 0 (no max),
-        // defaultOrderExpiration = 0 (no expiration),
-        // requireWhitelist = true.
-        address proxyAddress = Upgrades.deployUUPSProxy(
-            "OTCTrading.sol",
-            abi.encodeCall(
-                OTCTrading.initialize,
-                (baseToken, defaultCounterpartyToken, feeRecipient, admin, 25, 50, 100, 0, 0, true)
-            )
+        // UUPS proxy. Upgrades are authorized by UPGRADER_ROLE on the implementation — put that role
+        // behind a Timelock + multisig for production: users hold standing allowances here and need
+        // a public window to revoke and exit before new settlement code takes effect.
+        address proxy = Upgrades.deployUUPSProxy(
+            "OTCTrading.sol", abi.encodeCall(OTCTrading.initialize, (admin, approver, upgrader, forwarder))
         );
-
-        otc = OTCTrading(proxyAddress);
-
-        console.log("===========================================");
-        console.log("Proxy address (USE THIS):", proxyAddress);
-        console.log("===========================================");
-        address implementationAddress = Upgrades.getImplementationAddress(proxyAddress);
-        console.log("Implementation address (reference only):", implementationAddress);
-
-        // To enable native-ETH-denominated orders, the admin allow-lists address(0):
-        //   otc.addCounterpartyToken(address(0));
+        otc = OTCTrading(proxy);
 
         vm.stopBroadcast();
+
+        console.log("===========================================");
+        console.log("Proxy address (USE THIS):", proxy);
+        console.log("===========================================");
+        console.log("Implementation (reference only):", Upgrades.getImplementationAddress(proxy));
+        console.log("");
+        console.log("Next: list an offering with script/CreateOffering.s.sol");
     }
 }

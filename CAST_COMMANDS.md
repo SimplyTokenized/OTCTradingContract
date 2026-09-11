@@ -1,562 +1,274 @@
-# Cast Commands for OTC Trading Contract
+# `cast` command reference
 
-This document contains `cast` commands to interact with and test the OTC Trading contract.
+Every call against an OTCTrading v2 deployment, as `cast` one-liners. v1's commands are gone: almost
+all of them took a contract-wide setting that is now a property of an **offering**, so nearly every
+command here carries an `offeringId`.
 
-> ⚠️ **The private keys in this document are the well-known, publicly published Anvil/Foundry
-> development keys.** They are intended for **local testing only**. They control no real funds and
-> must **never** be used on a public testnet or mainnet. On live networks, sign with a keystore
-> account (`--account <name>`) or a hardware wallet — never paste a raw private key.
->
-> **Interface note:** `createOrder` takes an `OrderType` as its first argument
-> (`0` = BUY, `1` = SELL). All examples below use `1` (SELL) unless noted.
+## Setup
 
-## Prerequisites
+```bash
+export OTC=0x...                  # the proxy — always the proxy, never the implementation
+export RPC=$ETH_SEPOLIA_RPC
+export ACCOUNT=my-keystore-account   # cast wallet; never a raw key on a public network
+```
 
-- Start a local Anvil node: `anvil` (runs on `http://localhost:8545`)
-- Deploy the OTC contract first (see deployment section)
-- Deploy the base ERC20 token and counterparty token (e.g., USDC)
-- Set environment variables:
-  ```bash
-  export OTC_ADDRESS=<your_otc_contract_address>
-  export BASE_TOKEN=<base_erc20_token_address>
-  export COUNTERPARTY_TOKEN=<usdc_or_other_token_address>
-  export RPC_URL=http://localhost:8545  # or your testnet RPC
-  export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80  # Anvil default
-  export ADMIN=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266  # Anvil default account
-  export USER1=0x70997970C51812dc3A010C7d01b50e0d17dc79C8  # Anvil account 1
-  export USER2=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC  # Anvil account 2
-  ```
-
-## Default Anvil Accounts (Local Testing)
-
-- **Account 0 (Admin)**: `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`
-- **Account 1**: `0x70997970C51812dc3A010C7d01b50e0d17dc79C8`
-- **Account 2**: `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC`
-- **Private Key (Account 0)**: `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80`
+Read-only calls use `cast call`; anything that changes state uses `cast send`. Every `cast send`
+below assumes `--rpc-url $RPC --account $ACCOUNT`.
 
 ---
 
-## 1. Contract Information (Read Operations)
+## Offerings
 
-### Get Base Token Address
+### List an offering
+
+`createOffering` takes one struct. The tuple order is:
+`(baseToken, feeRecipient, eligibilityRegistry, makerFeeBps, takerFeeBps, defaultOrderExpiration, minOrderSize, maxOrderSize, offeringRef, counterpartyTokens[])`
+
 ```bash
-cast call $OTC_ADDRESS "baseToken()(address)" --rpc-url $RPC_URL
+cast send $OTC \
+  "createOffering((address,address,address,uint16,uint16,uint48,uint256,uint256,bytes32,address[]))" \
+  "($BASE_TOKEN,$FEE_RECIPIENT,$REGISTRY,25,50,2592000,1000000000000000000,0,$(cast keccak "FUND-2026-A"),[$USDC,0x0000000000000000000000000000000000000000])" \
+  --rpc-url $RPC --account $ACCOUNT
 ```
 
-### Get Fee Recipient
+`address(0)` in `counterpartyTokens` enables native-ETH pricing. `$REGISTRY` may be `0x0` for an
+ungated offering. The returned id is in the `OfferingCreated` event.
+
+### Read one
+
 ```bash
-cast call $OTC_ADDRESS "feeRecipient()(address)" --rpc-url $RPC_URL
+cast call $OTC "getOffering(uint256)" 1 --rpc-url $RPC
+cast call $OTC "offeringCounterpartyTokens(uint256,address)" 1 $USDC --rpc-url $RPC
+cast call $OTC "nextOfferingId()" --rpc-url $RPC     # ids run 1 … nextOfferingId-1
 ```
 
-### Get Maker Fee (in basis points)
+### Settlement assets
+
 ```bash
-cast call $OTC_ADDRESS "makerFeeBps()(uint256)" --rpc-url $RPC_URL
+cast send $OTC "allowCounterpartyToken(uint256,address)"    1 $USDC --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "allowCounterpartyToken(uint256,address)"    1 0x0000000000000000000000000000000000000000 --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "disallowCounterpartyToken(uint256,address)" 1 $USDC --rpc-url $RPC --account $ACCOUNT
 ```
 
-### Get Taker Fee (in basis points)
+De-listing stops **new** orders. Orders already resting in that asset stay fillable — clear them
+with `adminCancelOrders` if that is what you meant.
+
+### Economics and limits
+
 ```bash
-cast call $OTC_ADDRESS "takerFeeBps()(uint256)" --rpc-url $RPC_URL
+# ADMIN_ROLE. Max 1000 bps (10%) either side. Never retroactive: resting orders keep their rates.
+cast send $OTC "setOfferingFees(uint256,uint16,uint16)" 1 25 50 --rpc-url $RPC --account $ACCOUNT
+
+# OPERATOR_ROLE. maxOrderSize 0 = no ceiling; expiry 0 = orders never expire.
+cast send $OTC "setOfferingLimits(uint256,uint256,uint256,uint48)" 1 1000000000000000000 0 2592000 \
+  --rpc-url $RPC --account $ACCOUNT
 ```
 
-### Get Minimum Order Size
+### Halt one offering
+
 ```bash
-cast call $OTC_ADDRESS "minOrderSize()(uint256)" --rpc-url $RPC_URL
+cast send $OTC "setOfferingPaused(uint256,bool)" 1 true  --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "setOfferingPaused(uint256,bool)" 1 false --rpc-url $RPC --account $ACCOUNT
 ```
 
-### Check if Whitelist is Required
-```bash
-cast call $OTC_ADDRESS "requireWhitelist()(bool)" --rpc-url $RPC_URL
-```
-
-### Check if Address is Whitelisted
-```bash
-cast call $OTC_ADDRESS "whitelist(address)(bool)" <ADDRESS> --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast call $OTC_ADDRESS "whitelist(address)(bool)" $USER1 --rpc-url $RPC_URL
-```
-
-### Check if Counterparty Token is Allowed
-```bash
-cast call $OTC_ADDRESS "allowedCounterpartyTokens(address)(bool)" <TOKEN_ADDRESS> --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast call $OTC_ADDRESS "allowedCounterpartyTokens(address)(bool)" $COUNTERPARTY_TOKEN --rpc-url $RPC_URL
-```
-
-### Get Next Order ID
-```bash
-cast call $OTC_ADDRESS "nextOrderId()(uint256)" --rpc-url $RPC_URL
-```
-
-### Check if Contract is Paused
-```bash
-cast call $OTC_ADDRESS "paused()(bool)" --rpc-url $RPC_URL
-```
-
-### Check ETH Escrowed for a BUY+ETH Order
-```bash
-cast call $OTC_ADDRESS "ethEscrowed(uint256)(uint256)" <ORDER_ID> --rpc-url $RPC_URL
-```
-
-### Check Claimable ETH (pending withdrawal) for an Address
-```bash
-cast call $OTC_ADDRESS "pendingWithdrawals(address)(uint256)" <ADDRESS> --rpc-url $RPC_URL
-```
+Cancelling and withdrawing keep working while an offering is paused.
 
 ---
 
-## 2. Order Operations
+## Trading
 
-### Get Order Details
+### Place an order
+
 ```bash
-cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,uint8,address,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256)" <ORDER_ID> --rpc-url $RPC_URL
+# SELL 1000 base for 50,000 USDC — approve first; nothing is deposited.
+cast send $BASE_TOKEN "approve(address,uint256)" $OTC 1000000000000000000000 --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "createOrder(uint256,uint8,address,uint256,uint256)" \
+  1 1 $USDC 1000000000000000000000 50000000000 --rpc-url $RPC --account $ACCOUNT
+
+# BUY 1000 base for 50,000 USDC — approve price + maker fee.
+cast send $USDC "approve(address,uint256)" $OTC 50125000000 --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "createOrder(uint256,uint8,address,uint256,uint256)" \
+  1 0 $USDC 1000000000000000000000 50000000000 --rpc-url $RPC --account $ACCOUNT
+
+# BUY priced in ETH — the ONE escrowed case: send price + maker fee as value.
+cast send $OTC "createOrder(uint256,uint8,address,uint256,uint256)" \
+  1 0 0x0000000000000000000000000000000000000000 1000000000000000000000 10000000000000000000 \
+  --value 10025000000000000000 --rpc-url $RPC --account $ACCOUNT
 ```
 
-**Note:** The return values are: `(id, maker, orderType, counterpartyToken, baseTokenAmount, counterpartyTokenAmount, filledAmount, isActive, createdAt, expiresAt, makerFeeBps, takerFeeBps)` where `orderType` is `0` = BUY, `1` = SELL.
+`orderType`: `0` = BUY, `1` = SELL.
 
-**Example:**
+### Quote before you fill
+
 ```bash
-cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,uint8,address,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256)" 1 --rpc-url $RPC_URL
+# returns (counterpartyAmount, makerFee, takerFee, takerNet, makerNet)
+# SELL: takerNet is what the taker pays, makerNet what the maker receives.
+# BUY:  takerNet is what the taker receives, makerNet what the maker pays.
+cast call $OTC "quoteFill(uint256,uint256)" 1 400000000000000000000 --rpc-url $RPC
 ```
 
-### Get Remaining Amount in Order
+### Fill
+
 ```bash
-cast call $OTC_ADDRESS "getRemainingAmount(uint256)(uint256)" <ORDER_ID> --rpc-url $RPC_URL
+# ERC-20-priced: approve takerNet, then fill. A partial fill must be at least the offering's
+# minOrderSize unless it takes the remainder.
+cast send $USDC "approve(address,uint256)" $OTC 20100000000 --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "fillOrder(uint256,uint256)" 1 400000000000000000000 --rpc-url $RPC --account $ACCOUNT
+
+# Filling a SELL priced in ETH: send takerNet as value. Excess comes straight back.
+cast send $OTC "fillOrder(uint256,uint256)" 1 400000000000000000000 \
+  --value 4020000000000000000 --rpc-url $RPC --account $ACCOUNT
 ```
 
-**Example:**
+### Cancel and clean up
+
 ```bash
-cast call $OTC_ADDRESS "getRemainingAmount(uint256)(uint256)" 1 --rpc-url $RPC_URL
+cast send $OTC "cancelOrder(uint256)"        1 --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "batchCancelOrders(uint256[])" "[1,2,3]" --rpc-url $RPC --account $ACCOUNT
+
+# Permissionless. Escrow goes back to the MAKER, never the caller. Max 200 ids.
+cast send $OTC "cleanupExpiredOrders(uint256[])" "[7,8,9]" --rpc-url $RPC --account $ACCOUNT
 ```
 
-### Get User's Order IDs
+### Claim your ETH
+
 ```bash
-cast call $OTC_ADDRESS "getUserOrders(address)(uint256[])" <USER_ADDRESS> --rpc-url $RPC_URL
+cast call $OTC "pendingWithdrawals(address)" $ME --rpc-url $RPC
+cast send $OTC "withdraw()" --rpc-url $RPC --account $ACCOUNT
 ```
 
-**Example:**
-```bash
-cast call $OTC_ADDRESS "getUserOrders(address)(uint256[])" $USER1 --rpc-url $RPC_URL
-```
-
-### Check if an Order is Currently Fundable
-```bash
-# True if the maker's side is currently covered (allowance+balance, or ETH escrow).
-# A false result does NOT deactivate the order — fundability is transient. Use this to filter the book.
-cast call $OTC_ADDRESS "isOrderFundable(uint256)(bool)" <ORDER_ID> --rpc-url $RPC_URL
-```
+Maker proceeds, escrow refunds and fees are all claimed this way. Never pausable, never gated.
 
 ---
 
-## 3. Trading Functions
+## Reading the book
 
-### Create Order
-
-> **Non-custodial:** approving grants an **allowance** — your tokens stay in your wallet until a
-> taker fills. (Exception: a BUY order priced in ETH escrows `msg.value` at creation, since ETH
-> can't be pulled later.) A SELL maker approves the base token; a BUY maker approves
-> `counterpartyTokenAmount + makerFee` of the counterparty token.
-
-First, approve the base token (SELL) — an allowance, not a transfer:
 ```bash
-cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS <AMOUNT> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
+cast call $OTC "getOrder(uint256)" 1 --rpc-url $RPC
+cast call $OTC "getRemainingAmount(uint256)" 1 --rpc-url $RPC
+cast call $OTC "isOrderFundable(uint256)" 1 --rpc-url $RPC
+cast call $OTC "isOrderExpired(uint256)" 1 --rpc-url $RPC
+cast call $OTC "orderBaseToken(uint256)" 1 --rpc-url $RPC
 
-**Example:**
-```bash
-# Approve 1000 tokens (assuming 18 decimals)
-cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS 1000000000000000000000 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
+# One page of an offering's ids → (uint256[] ids, uint256 total)
+cast call $OTC "getOfferingOrders(uint256,uint256,uint256)" 1 0 100 --rpc-url $RPC
+cast call $OTC "getMakerOrders(address,uint256,uint256)" $ME 0 100 --rpc-url $RPC
+cast call $OTC "offeringOrderCount(uint256)" 1 --rpc-url $RPC
 
-Then create the order (first argument is the order type: `0` = BUY, `1` = SELL):
-```bash
-cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
-  <ORDER_TYPE> \
-  <COUNTERPARTY_TOKEN> \
-  <BASE_TOKEN_AMOUNT> \
-  <COUNTERPARTY_TOKEN_AMOUNT> \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example (SELL):**
-```bash
-# SELL order: sell 1000 BASE tokens for 2000 USDC (assuming 6 decimals for USDC)
-cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
-  1 \
-  $COUNTERPARTY_TOKEN \
-  1000000000000000000000 \
-  2000000000 \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example (BUY with ETH counterparty):**
-```bash
-# BUY order: buy 1000 BASE tokens for 2 ETH.
-# The maker pre-funds the maker fee, so the ETH sent = price + maker fee.
-# With the default 25 bps maker fee: 2 ETH + 0.005 ETH = 2.005 ETH.
-# Requires ETH (address(0)) to be an allowed counterparty token.
-cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
-  0 \
-  0x0000000000000000000000000000000000000000 \
-  1000000000000000000000 \
-  2000000000000000000 \
-  --value 2005000000000000000 \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-> **Note for BUY orders (ERC-20 counterparty):** approve `counterpartyTokenAmount + makerFee`
-> before calling `createOrder`, since the maker pre-funds the maker fee.
-
-### Fill Order
-
-First, approve counterparty tokens (including taker fee):
-```bash
-# Calculate: counterpartyAmount + takerFee
-# takerFee = (counterpartyAmount * takerFeeBps) / 10000
-cast send $COUNTERPARTY_TOKEN "approve(address,uint256)" $OTC_ADDRESS <TOTAL_AMOUNT> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-# For 1000 USDC fill with 0.5% taker fee = 1005 USDC total
-cast send $COUNTERPARTY_TOKEN "approve(address,uint256)" $OTC_ADDRESS 1005000000 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-Then fill the order:
-```bash
-cast send $OTC_ADDRESS "fillOrder(uint256,uint256)" \
-  <ORDER_ID> \
-  <BASE_TOKEN_FILL_AMOUNT> \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-# Fill 500 BASE tokens from order 1
-cast send $OTC_ADDRESS "fillOrder(uint256,uint256)" \
-  1 \
-  500000000000000000000 \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Cancel Order
-```bash
-cast send $OTC_ADDRESS "cancelOrder(uint256)" <ORDER_ID> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast send $OTC_ADDRESS "cancelOrder(uint256)" 1 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Withdraw Accrued ETH (pull payment)
-```bash
-# Claim ETH owed to you: maker proceeds, escrow refunds, or (for the fee recipient) fees.
-cast send $OTC_ADDRESS "withdraw()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Cleanup Expired Orders (permissionless)
-```bash
-# Anyone may deactivate expired orders; BUY+ETH escrow is credited back to each maker.
-cast send $OTC_ADDRESS "cleanupExpiredOrders(uint256[])" "[1,2,3]" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+# Live orders, in caller-bounded windows → (uint256[] ids, uint256 nextCursor).
+# Keep calling with the cursor it returns until it reaches offeringOrderCount.
+cast call $OTC "scanActiveOrders(uint256,uint256,uint256)" 1 0 200 --rpc-url $RPC
 ```
 
 ---
 
-## 4. Admin Functions
+## Compliance
 
-### Add Counterparty Token
 ```bash
-cast send $OTC_ADDRESS "addCounterpartyToken(address)" <TOKEN_ADDRESS> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+cast call $OTC "isEligibleToTrade(uint256,address)" 1 $WHO --rpc-url $RPC
+
+# WhitelistRegistry (the companion contract), owner-only:
+cast send $REGISTRY "add(address)"          $WHO --rpc-url $RPC --account $ACCOUNT
+cast send $REGISTRY "remove(address)"       $WHO --rpc-url $RPC --account $ACCOUNT
+cast send $REGISTRY "addBatch(address[])"   "[$A,$B]" --rpc-url $RPC --account $ACCOUNT
+cast call $REGISTRY "isWhitelisted(address)" $WHO --rpc-url $RPC
 ```
 
-**Example:**
+An offering's registry cannot be changed after it is listed — there is no setter. To move an
+instrument to a different gate, list a new offering.
+
+### Force an order off the book (compliance)
+
 ```bash
-cast send $OTC_ADDRESS "addCounterpartyToken(address)" 0xNewTokenAddress --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+cast send $OTC "adminCancelOrder(uint256)"    42 --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "adminCancelOrders(uint256[])" "[42,43]" --rpc-url $RPC --account $ACCOUNT
 ```
 
-### Remove Counterparty Token
+Escrow returns to the **maker**. The distinct `OrderAdminCancelled` event keeps it auditable.
+
+---
+
+## Four-eyes actions
+
+Each needs a proposal by the owning role and an approval from a **different** APPROVER. Proposals
+lapse after 7 days.
+
 ```bash
-cast send $OTC_ADDRESS "removeCounterpartyToken(address)" <TOKEN_ADDRESS> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
+# Redirect an offering's fees
+cast send $OTC "proposeSetOfferingFeeRecipient(uint256,address)" 1 $NEW --rpc-url $RPC --account $ADMIN_ACCOUNT
+cast send $OTC "approveSetOfferingFeeRecipient(uint256,address)" 1 $NEW --rpc-url $RPC --account $APPROVER_ACCOUNT
 
-**Example:**
-```bash
-cast send $OTC_ADDRESS "removeCounterpartyToken(address)" $COUNTERPARTY_TOKEN --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
+# Close an offering for good — pause it first, and its book must be empty
+cast send $OTC "setOfferingPaused(uint256,bool)" 1 true --rpc-url $RPC --account $ACCOUNT
+cast send $OTC "proposeCloseOffering(uint256)" 1 --rpc-url $RPC --account $ADMIN_ACCOUNT
+cast send $OTC "approveCloseOffering(uint256)" 1 --rpc-url $RPC --account $APPROVER_ACCOUNT
 
-### Update Fees
-```bash
-cast send $OTC_ADDRESS "updateFees(uint256,uint256)" <MAKER_FEE_BPS> <TAKER_FEE_BPS> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
+# Turn ERC-2771 relaying on (an address) or off (0x0)
+cast send $OTC "proposeSetTrustedForwarder(address)" $FWD --rpc-url $RPC --account $ADMIN_ACCOUNT
+cast send $OTC "approveSetTrustedForwarder(address)" $FWD --rpc-url $RPC --account $APPROVER_ACCOUNT
 
-**Example:**
-```bash
-# Set maker fee to 0.3% (30 bps) and taker fee to 0.6% (60 bps)
-cast send $OTC_ADDRESS "updateFees(uint256,uint256)" 30 60 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
+# Rescue stray assets (0x0 = ETH). Cannot touch escrow or pending withdrawals.
+cast call $OTC "rescuableAmount(address)" 0x0000000000000000000000000000000000000000 --rpc-url $RPC
+cast send $OTC "proposeRescueAssets(address,address,uint256)" $TOKEN $TO $AMT --rpc-url $RPC --account $ADMIN_ACCOUNT
+cast send $OTC "approveRescueAssets(address,address,uint256)" $TOKEN $TO $AMT --rpc-url $RPC --account $APPROVER_ACCOUNT
 
-### Update Minimum Order Size
-```bash
-cast send $OTC_ADDRESS "updateMinOrderSize(uint256)" <MIN_ORDER_SIZE> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast send $OTC_ADDRESS "updateMinOrderSize(uint256)" 200 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Update Whitelist Requirement
-```bash
-cast send $OTC_ADDRESS "updateWhitelistRequirement(bool)" <true_or_false> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-# Disable whitelist requirement
-cast send $OTC_ADDRESS "updateWhitelistRequirement(bool)" false --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-
-# Enable whitelist requirement
-cast send $OTC_ADDRESS "updateWhitelistRequirement(bool)" true --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Add to Whitelist
-```bash
-cast send $OTC_ADDRESS "addToWhitelist(address)" <ADDRESS> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast send $OTC_ADDRESS "addToWhitelist(address)" $USER1 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Remove from Whitelist
-```bash
-cast send $OTC_ADDRESS "removeFromWhitelist(address)" <ADDRESS> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast send $OTC_ADDRESS "removeFromWhitelist(address)" $USER1 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Update Fee Recipient
-```bash
-cast send $OTC_ADDRESS "updateFeeRecipient(address)" <NEW_FEE_RECIPIENT> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-**Example:**
-```bash
-cast send $OTC_ADDRESS "updateFeeRecipient(address)" 0xNewFeeRecipient --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Admin Force-Cancel an Order (compliance)
-```bash
-# Deactivates any active order (e.g. a de-whitelisted maker's). Non-custodial: any BUY+ETH escrow
-# is credited back to the MAKER, never to the admin. Emits OrderAdminCancelled.
-cast send $OTC_ADDRESS "adminCancelOrder(uint256)" <ORDER_ID> --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-
-# Batch variant:
-cast send $OTC_ADDRESS "adminCancelOrders(uint256[])" "[1,2,3]" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Pause Trading
-```bash
-cast send $OTC_ADDRESS "pause()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-```
-
-### Unpause Trading
-```bash
-cast send $OTC_ADDRESS "unpause()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+# Inspect or withdraw a pending proposal
+cast call $OTC "offeringFeeRecipientProposalId(uint256,address)" 1 $NEW --rpc-url $RPC
+cast call $OTC "proposals(bytes32)" $PROPOSAL_ID --rpc-url $RPC
+cast send $OTC "cancelProposal(bytes32)" $PROPOSAL_ID --rpc-url $RPC --account $ACCOUNT
 ```
 
 ---
 
-## 5. Role Management
+## Roles
 
-### Check if Address has DEFAULT_ADMIN_ROLE
-```bash
-# DEFAULT_ADMIN_ROLE is 0x0000000000000000000000000000000000000000000000000000000000000000
-cast call $OTC_ADDRESS "hasRole(bytes32,address)(bool)" \
-  0x0000000000000000000000000000000000000000000000000000000000000000 \
-  <ADDRESS> \
-  --rpc-url $RPC_URL
-```
-
-### Check if Address has ADMIN_ROLE
-```bash
-ADMIN_ROLE=$(cast keccak "ADMIN_ROLE")
-cast call $OTC_ADDRESS "hasRole(bytes32,address)(bool)" $ADMIN_ROLE <ADDRESS> --rpc-url $RPC_URL
-```
-
-### Check if Address has UPGRADER_ROLE
-```bash
-UPGRADER_ROLE=$(cast keccak "UPGRADER_ROLE")
-cast call $OTC_ADDRESS "hasRole(bytes32,address)(bool)" $UPGRADER_ROLE <ADDRESS> --rpc-url $RPC_URL
-```
-
----
-
-## 6. Complete Testing Workflow
-
-Here's a complete workflow to test all functionality:
+Granting waits 2 days. Revoking does not.
 
 ```bash
-# 1. Set variables
-export OTC_ADDRESS=<your_deployed_otc_address>
-export BASE_TOKEN=<base_token_address>
-export COUNTERPARTY_TOKEN=<usdc_address>
-export RPC_URL=http://localhost:8545
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-export ADMIN=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
-export USER1=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-export USER1_KEY=0x59c6995e998f97a5a0044966f0945389ac9e75b579d0e2e7e5b1e7b2e2b2e2b2
+export ADMIN_ROLE=$(cast call $OTC "ADMIN_ROLE()" --rpc-url $RPC)
+export OPERATOR_ROLE=$(cast call $OTC "OPERATOR_ROLE()" --rpc-url $RPC)
+export APPROVER_ROLE=$(cast call $OTC "APPROVER_ROLE()" --rpc-url $RPC)
+export UPGRADER_ROLE=$(cast call $OTC "UPGRADER_ROLE()" --rpc-url $RPC)
 
-# 2. Check contract info
-cast call $OTC_ADDRESS "baseToken()(address)" --rpc-url $RPC_URL
-cast call $OTC_ADDRESS "makerFeeBps()(uint256)" --rpc-url $RPC_URL
-cast call $OTC_ADDRESS "takerFeeBps()(uint256)" --rpc-url $RPC_URL
-cast call $OTC_ADDRESS "minOrderSize()(uint256)" --rpc-url $RPC_URL
+cast send $OTC "scheduleRoleGrant(bytes32,address)" $OPERATOR_ROLE $WHO --rpc-url $RPC --account $ACCOUNT
+cast call $OTC "roleGrantWindow(bytes32,address)"   $OPERATOR_ROLE $WHO --rpc-url $RPC   # (effectiveFrom, expiresAt)
 
-# 3. Add user to whitelist
-cast send $OTC_ADDRESS "addToWhitelist(address)" $USER1 --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+# …two days later, and within 7 days of that:
+cast send $OTC "grantRole(bytes32,address)" $OPERATOR_ROLE $WHO --rpc-url $RPC --account $ACCOUNT
 
-# 4. Check if user is whitelisted
-cast call $OTC_ADDRESS "whitelist(address)(bool)" $USER1 --rpc-url $RPC_URL
+# Veto a pending grant (the role's admin, or an ADMIN_ROLE guardian)
+cast send $OTC "cancelRoleGrant(bytes32,address)" $OPERATOR_ROLE $WHO --rpc-url $RPC --account $ACCOUNT
 
-# 5. Check counterparty token
-cast call $OTC_ADDRESS "allowedCounterpartyTokens(address)(bool)" $COUNTERPARTY_TOKEN --rpc-url $RPC_URL
-
-# 6. Create order (as USER1)
-# First approve base tokens
-cast send $BASE_TOKEN "approve(address,uint256)" $OTC_ADDRESS 1000000000000000000000 \
-  --private-key $USER1_KEY --rpc-url $RPC_URL
-
-# Create SELL order: sell 1000 BASE for 2000 USDC (order type 1 = SELL)
-cast send $OTC_ADDRESS "createOrder(uint8,address,uint256,uint256)" \
-  1 \
-  $COUNTERPARTY_TOKEN \
-  1000000000000000000000 \
-  2000000000 \
-  --private-key $USER1_KEY --rpc-url $RPC_URL
-
-# 7. Get order details
-cast call $OTC_ADDRESS "getOrder(uint256)(uint256,address,uint8,address,uint256,uint256,uint256,bool,uint256,uint256,uint256,uint256)" \
-  1 --rpc-url $RPC_URL
-
-# 8. Fill order (as ADMIN)
-# First approve counterparty tokens (1000 USDC + 5 USDC fee = 1005 USDC)
-cast send $COUNTERPARTY_TOKEN "approve(address,uint256)" $OTC_ADDRESS 1005000000 \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-
-# Fill 500 BASE tokens
-cast send $OTC_ADDRESS "fillOrder(uint256,uint256)" \
-  1 \
-  500000000000000000000 \
-  --private-key $PRIVATE_KEY --rpc-url $RPC_URL
-
-# 9. Check remaining amount
-cast call $OTC_ADDRESS "getRemainingAmount(uint256)(uint256)" 1 --rpc-url $RPC_URL
-
-# 10. Cancel remaining order (as USER1)
-cast send $OTC_ADDRESS "cancelOrder(uint256)" 1 --private-key $USER1_KEY --rpc-url $RPC_URL
-
-# 11. Check balances
-cast call $BASE_TOKEN "balanceOf(address)(uint256)" $USER1 --rpc-url $RPC_URL
-cast call $BASE_TOKEN "balanceOf(address)(uint256)" $ADMIN --rpc-url $RPC_URL
-cast call $COUNTERPARTY_TOKEN "balanceOf(address)(uint256)" $USER1 --rpc-url $RPC_URL
-cast call $COUNTERPARTY_TOKEN "balanceOf(address)(uint256)" $ADMIN --rpc-url $RPC_URL
+# Immediate, by design
+cast send $OTC "revokeRole(bytes32,address)" $OPERATOR_ROLE $WHO --rpc-url $RPC --account $ACCOUNT
 ```
 
 ---
 
-## 7. Helper Scripts
+## Venue-wide
 
-### Get all role hashes
 ```bash
-echo "DEFAULT_ADMIN_ROLE: 0x0000000000000000000000000000000000000000000000000000000000000000"
-echo "ADMIN_ROLE: $(cast keccak "ADMIN_ROLE")"
-echo "UPGRADER_ROLE: $(cast keccak "UPGRADER_ROLE")"
+cast send $OTC "pause()"   --rpc-url $RPC --account $ADMIN_ACCOUNT
+cast send $OTC "unpause()" --rpc-url $RPC --account $ADMIN_ACCOUNT
+
+# Reserve accounting — what the venue holds and what it owes
+cast call $OTC "totalEthEscrowed()" --rpc-url $RPC
+cast call $OTC "totalPendingWithdrawals()" --rpc-url $RPC
+cast balance $OTC --rpc-url $RPC
 ```
 
-### Calculate fees
-```bash
-# Calculate maker fee (0.25% = 25 bps)
-# makerFee = (amount * 25) / 10000
-BASE_AMOUNT=1000000000000000000000  # 1000 tokens
-MAKER_FEE_BPS=25
-MAKER_FEE=$(cast --to-uint256 $((BASE_AMOUNT * MAKER_FEE_BPS / 10000)))
-echo "Maker fee: $MAKER_FEE"
-
-# Calculate taker fee (0.5% = 50 bps)
-COUNTERPARTY_AMOUNT=2000000000  # 2000 USDC
-TAKER_FEE_BPS=50
-TAKER_FEE=$(cast --to-uint256 $((COUNTERPARTY_AMOUNT * TAKER_FEE_BPS / 10000)))
-echo "Taker fee: $TAKER_FEE"
-```
-
-### Convert amounts
-```bash
-# Convert 1 token to wei (18 decimals)
-cast --to-wei 1 ether
-
-# Convert wei to tokens
-cast --from-wei <amount_in_wei> ether
-
-# For USDC (6 decimals): 1 USDC = 1000000
-cast --to-uint256 1000000
-```
-
-### Get current block number
-```bash
-cast block-number --rpc-url $RPC_URL
-```
-
-### Get account balance (ETH)
-```bash
-cast balance <ADDRESS> --rpc-url $RPC_URL
-```
+The balance must always be at least the sum of the two.
 
 ---
 
-## 8. Event Monitoring
+## Events worth indexing
 
-### Monitor OrderCreated events
 ```bash
-cast logs --from-block 0 "OrderCreated(uint256,address,uint8,address,uint256,uint256)" --rpc-url $RPC_URL
+cast logs --address $OTC "OrderCreated(uint256,uint256,address,uint8,address,uint256,uint256,uint48)" --rpc-url $RPC
+cast logs --address $OTC "OrderFilled(uint256,uint256,address,uint256,uint256,uint256,uint256)" --rpc-url $RPC
+cast logs --address $OTC "OfferingCreated(uint256,address,bytes32,address,address)" --rpc-url $RPC
+cast logs --address $OTC "ActionProposed(bytes32,uint8,address)" --rpc-url $RPC
+cast logs --address $OTC "OrderCleanedUp(uint256,uint256,address)" --rpc-url $RPC
 ```
 
-### Monitor OrderFilled events
-```bash
-cast logs --from-block 0 "OrderFilled(uint256,address,uint256,uint256,uint256,uint256)" --rpc-url $RPC_URL
-```
-
-### Monitor OrderCancelled events
-```bash
-cast logs --from-block 0 "OrderCancelled(uint256,address)" --rpc-url $RPC_URL
-```
-
----
-
-## Notes
-
-- All amounts are in the token's smallest unit (wei equivalent)
-- For tokens with 18 decimals: 1 token = 1000000000000000000 wei
-- For USDC (6 decimals): 1 USDC = 1000000
-- Always approve tokens before creating or filling orders
-- Order type is the first `createOrder` argument: `0` = BUY, `1` = SELL
-- **Non-custodial:** makers grant an allowance and keep custody; nothing is escrowed except a BUY order priced in ETH (which sends `counterpartyAmount + makerFee` as `msg.value`)
-- **SELL orders:** the taker pays `counterpartyAmount + takerFee`; the maker receives `counterpartyAmount − makerFee`
-- **BUY orders:** the maker provides `counterpartyAmount + makerFee` (allowance, or ETH escrow); the taker (seller) receives `counterpartyAmount − takerFee`
-- The order creator (maker) always bears the maker fee; the filler (taker) always bears the taker fee
-- **ETH payouts are pull-based:** maker proceeds, escrow refunds, and fees accrue as `pendingWithdrawals` and are claimed with `withdraw()`; only the taker is paid inline
-- Fee rates are snapshotted per order at creation and are not affected by later `updateFees` calls
-- Orders can be filled partially or fully
-- Only the order maker can cancel their own order; `ADMIN_ROLE` can force-cancel (escrow returns to the maker); anyone can `cleanupExpiredOrders`
-- When using testnet, replace `$RPC_URL` with your testnet RPC URL and use appropriate private keys
-- Always verify you have the required role before attempting admin operations
+`OrderCreated` and `OrderFilled` both index `offeringId`, so a per-offering feed is one filter.

@@ -2,14 +2,82 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+test = "test"
+script = "script"
+
+# EIP-1153 transient storage, used by ReentrancyGuardTransient.
 evm_version = "cancun"
+solc_version = "0.8.27"
+
+# `ast` and `build_info` are required by the OpenZeppelin Upgrades plugin, which validates
+# upgrade safety from a *full* compilation. After an incremental rebuild it refuses to run,
+# which is why the npm scripts clean before testing.
 ast = true
-ffi = true
 build_info = true
 extra_output = ["storageLayout"]
+ffi = true
+
 gas_reports = ["OTCTrading"]
+
 optimizer = true
+# ~22KB against the 24KB limit. A tenant-wide venue carries every offering's logic in one
+# implementation, so the headroom an audit needs is worth more here than the marginal runtime
+# gas a higher setting would buy.
 optimizer_runs = 200
 via_ir = true
+
+fs_permissions = [{ access = "read-write", path = "." }]
+
+[profile.default.fuzz]
+runs = 256
+
+# The invariants walk every order the run has created, so their cost grows with depth squared.
+# These numbers are chosen to keep a local run under a minute while still building books deep
+# enough for partial fills, expiries and withdrawals to interleave.
+[profile.default.invariant]
+runs = 32
+depth = 100
+fail_on_revert = false
+
+# Used by CI. Same build, more search: a pull request is where it is cheap to spend minutes
+# finding what 256 runs would not.
+[profile.ci]
+verbosity = 3
+
+[profile.ci.fuzz]
+runs = 1000
+
+[profile.ci.invariant]
+runs = 128
+depth = 250
+fail_on_revert = false
+
+# Fast feedback while writing code; never the profile that gates a merge. `via_ir` stays on: the
+# settlement path carries enough live values that the legacy pipeline runs out of stack, and
+# contorting the code to avoid that would cost more in readability than the build time it saves.
+# What this profile actually buys is a much shorter fuzz and invariant search.
+[profile.lite]
+optimizer_runs = 1
+
+[profile.lite.fuzz]
+runs = 32
+
+[profile.lite.invariant]
+runs = 16
+depth = 100
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+number_underscore = "preserve"
+multiline_func_header = "attributes_first"
+sort_imports = false
+
+[doc]
+out = "docs"
+title = "OTCTrading"
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
