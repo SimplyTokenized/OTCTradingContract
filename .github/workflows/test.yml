@@ -22,6 +22,10 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
@@ -31,8 +35,10 @@ jobs:
       - name: Run Forge fmt
         run: forge fmt --check
 
+      # A full build, not an incremental one: the OpenZeppelin upgrades validator
+      # that runs inside the tests refuses to read a partial build-info file.
       - name: Run Forge build
-        run: forge build --sizes
+        run: forge clean && forge build --sizes
 
       - name: Run Forge tests
         run: forge test -vvv

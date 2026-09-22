@@ -1,147 +1,155 @@
 # Non-Custodial OTC — Design Concept
 
-Status: **adopted.** `OTCTrading` is the settlement model described here — a **single** contract
-([`src/OTCTrading.sol`](src/OTCTrading.sol), UUPS-upgradeable) that handles both ERC-20 and native
-ETH. It is non-custodial **except** for BUY orders priced in ETH, which must escrow (see §4).
+How OTCTrading settles trades without holding anyone's assets, and the one place where it must.
+
+> v2 note: everything below is unchanged in spirit from v1, but the *scope* changed. The same
+> contract now carries every offering a tenant lists, so "the contract holds nothing" is no longer
+> a statement about one book — it is what keeps one book's mistake away from another's money. See
+> [§7](#7-many-offerings-one-balance).
+
+---
 
 ## 1. Motivation
 
-The old contract was **custodial**: makers deposited tokens into escrow, orders rested on-book,
-and takers filled later. That single choice was the root cause of a cluster of problems —
-dividend/income attribution on escrowed security tokens, a native-ETH handling surface, BUY-order
-fee pre-funding/refunds (Variant A), and an `emergencyWithdraw` power over user funds.
+A custodial OTC venue takes both sides' assets into the contract, holds them while orders rest, and
+pays them out on a fill. That is simple, and it is also the shape of most of the money lost in this
+space: every resting order is a deposit, so the contract's balance is the sum of everything anyone
+has ever failed to withdraw, and one bug reaches all of it.
 
-Going **non-custodial** removes the root cause: the contract never holds user funds. Makers keep
-custody in their own wallets and grant an **allowance**; settlement happens atomically at fill time
-via `transferFrom` on both legs. Every symptom above disappears rather than being patched.
+The alternative is to hold nothing. Makers keep custody; the contract is given permission to move
+their assets at the moment a counterparty appears, and does so atomically.
 
 ## 2. Model
 
-- Makers **`approve()`** the OTC contract for what they're offering; they do **not** deposit. An
-  order is backed by an allowance, not escrow.
-- At **fill**, both legs move atomically in one transaction: base and counterparty change hands
-  directly between maker and taker (plus fees to the fee recipient).
-- **Native ETH is a first-class counterparty token**, denoted by the sentinel `address(0)` — exactly
-  as in the original contract. No WETH, no wrapping, no periphery contract; `createOrder` and
-  `fillOrder` stay `payable`.
+**An order is an allowance, not a deposit.**
+
+1. The maker approves the contract for their side of the trade.
+2. They create an order naming a price and a size. Nothing moves.
+3. A taker fills it, whole or in part. In that single transaction the contract calls
+   `transferFrom` on both legs — maker to taker, taker to maker — and pays the fees.
+4. Cancelling is a state change. No funds move, because none were held.
+
+The contract's ERC-20 balance is zero at the start and end of every transaction. If it ever holds
+an ERC-20, someone mis-sent it.
 
 ### Settlement math
 
-For a fill of `b` base on an order priced `P` counterparty per `B` base, settlement is
-`s = b * P / B` (must be `> 0`, else revert). Fees use the order's **snapshotted** rates:
-`makerFee = s * makerFeeBps / 10000`, `takerFee = s * takerFeeBps / 10000`.
+For a fill of `baseAmount` against an order of `(baseTokenAmount, counterpartyTokenAmount)`:
 
-**SELL** (maker sells base, taker pays counterparty): base maker→taker `b`; counterparty
-taker→maker `s − makerFee`; fees taker→feeRecipient `makerFee + takerFee`. Taker pays `s + takerFee`.
+```
+counterparty = baseAmount × counterpartyTokenAmount / baseTokenAmount
+makerFee     = counterparty × order.makerFeeBps / 10_000
+takerFee     = counterparty × order.takerFeeBps / 10_000
+```
 
-**BUY** (maker buys base, taker sells base): base taker→maker `b`; counterparty maker→taker
-`s − takerFee`; fees maker→feeRecipient `makerFee + takerFee`. Maker pays `s + makerFee`.
+| | SELL (maker sells base) | BUY (maker buys base) |
+| --- | --- | --- |
+| Maker | −`baseAmount` base, +`counterparty − makerFee` | +`baseAmount` base, −`counterparty + makerFee` |
+| Taker | +`baseAmount` base, −`counterparty + takerFee` | −`baseAmount` base, +`counterparty − takerFee` |
+| Fees | `makerFee + takerFee` | `makerFee + takerFee` |
 
-Fee incidence is **symmetric for free**: the maker always bears the maker fee, the taker the taker
-fee — with no pre-funding and no refund logic, because nothing is ever escrowed.
+The division rounds **in the resting maker's favour**: up on a SELL, down on a BUY. On a BUY that is
+a requirement rather than a preference — see [§4](#4-native-eth-and-the-one-escrowed-case). A fill
+that settles to zero counterparty tokens is refused, or a taker could take base repeatedly while
+paying nothing. And a partial fill must be at least the offering's `minOrderSize` unless it takes
+the remainder: fees floor, so without a floor on fill size an order could be sliced into fills that
+each pay none.
 
-## 3. What changed vs the custodial contract
+## 3. What it costs
 
-**Gone:** escrow transfers in `createOrder` for every case **except BUY+ETH**; `emergencyWithdraw`
-over user funds; the `receive()` fallback; fund-returning cancel/cleanup for allowance-backed orders
-(now a flag flip).
+Non-custody is not free, and the honest list is short:
 
-**Kept:** order book, BUY/SELL, partial fills, snapshotted fees, whitelist, expiration, counterparty
-allowlist, pausability, role-based admin, reentrancy protection (`ReentrancyGuardTransient`), and the
-original `address(0) = ETH` API with `payable` `createOrder`/`fillOrder`.
+- **A resting order is not guaranteed fillable.** The maker may move their funds or revoke the
+  allowance at any moment. Fillability is a transient property, which is why `isOrderFundable` is a
+  view for filtering the book and *not* something that deactivates an order.
+- **A fill can fail on the maker's leg**, at the taker's gas expense. The frontend filters with
+  `isOrderFundable`; the contract does not pretend to guarantee more than it can.
+- **There is no "the contract owes you" ledger** for ERC-20. What you are owed is what your
+  counterparty transfers when the trade settles.
 
-**Fee incidence is symmetric in every case**: the maker bears the maker fee, the taker the taker fee.
-For allowance-backed orders this needs no pre-funding at all. For BUY+ETH the maker's escrow simply
-includes the maker fee up front, and each fill draws its share — no refund arithmetic beyond
-returning the unfilled remainder.
+What it buys: the contract is not a honeypot, a maker's assets stay productive while their order
+rests, and a compromise of this contract cannot drain what it was never given.
 
-## 4. Native ETH — and the one escrowed case
+## 4. Native ETH, and the one escrowed case
 
-Enable ETH orders by allow-listing the sentinel: `addCounterpartyToken(address(0))`.
+Native ETH has no `approve`. Three of the four combinations still work without custody:
 
-The asymmetry that drives the design: **an allowance can pull ERC-20 at a later fill, but nothing
-can pull native ETH from an absent wallet.** So whether ETH can be allowance-backed depends entirely
-on *who has to pay at fill time*:
+| Order | Counterparty asset | Who sends at fill time | Custody |
+| --- | --- | --- | --- |
+| SELL | ERC-20 | taker, inline | none |
+| BUY | ERC-20 | maker, via allowance | none |
+| SELL | ETH | taker, as `msg.value` | none |
+| **BUY** | **ETH** | the maker — **who is not present** | **escrow** |
 
-| Order | Who pays counterparty at fill | ETH works without escrow? |
-|-------|-------------------------------|---------------------------|
-| **SELL** priced in ETH | the **taker** — present in the fill tx | ✅ yes — sends `msg.value` with `fillOrder` |
-| **BUY** priced in ETH | the **maker** — *absent* from the fill tx | ❌ no — must pre-fund |
+A BUY priced in ETH is the exception: the maker's side must be paid in native ETH at a fill they do
+not participate in, and nothing can pull ETH from an absent account. So the maker escrows
+`counterpartyTokenAmount + makerFee` at creation. It is tracked per order in `ethEscrowed`, spent
+only by fills of that order, and credited back to the maker on cancel, cleanup or force-cancel.
 
-So **BUY + ETH is the sole custodial path**: the maker sends exactly
-`counterpartyAmount + makerFee` with `createOrder`, and the contract holds it. This is a deliberate,
-accepted trade-off — the alternative (making the maker wrap to WETH and approve) keeps the contract
-fund-free but changes the maker's UX.
+**Why BUY fills round down.** The escrow holds exactly `counterpartyTokenAmount + makerFee`. Because
+a sum of rounded-down parts never exceeds the rounded-down whole, no sequence of partial fills can
+draw past what is there — and the closing fill returns whatever rounding left behind, so escrow
+never strands ETH.
 
-Escrow is bounded and exactly accounted:
+## 5. Pull payments
 
-- Tracked per order in `ethEscrowed[orderId]`. There is **no `receive()`/`fallback`** — raw ETH sent
-  to the contract reverts — so the only ETH ever held backs either live escrow or an unclaimed
-  withdrawal. Invariant: `address(this).balance == Σ ethEscrowed + Σ pendingWithdrawals`.
-- Each fill draws down exactly its cost (`settlement + makerFee`); the closing fill also releases any
-  rounding **dust** to the maker, so escrow never strands ETH.
-- Any unfilled remainder is returned to the **maker** on `cancelOrder`, `cleanupExpiredOrders`, and
-  `adminCancelOrder`. An admin force-cancel returns the ETH to its maker — **never to the admin**;
-  a permissionless cleanup returns it to the maker — **never to the caller**.
+ETH owed to a **resting** party is booked, not sent:
 
-**ETH payouts to resting parties use PULL PAYMENTS.** A maker's ETH proceeds/refund and the fee
-recipient's fees are booked into `pendingWithdrawals` (event `EthCredited`) and claimed later via
-`withdraw()`; they are never pushed. Only the active taker (`msg.sender`) is paid inline. This means
-a maker or fee recipient that cannot receive ETH can **never** block settlement, a cancel, or an
-admin/compliance force-cancel — they just accrue a claimable balance. (This closes the earlier
-push-payment liveness/lock bugs: a hostile maker could otherwise brick `adminCancelOrder` and poison
-admin batches, and a broken `feeRecipient` could halt all ETH fills.)
+- a maker's proceeds from a SELL priced in ETH,
+- a maker's escrow refund on a cancel, cleanup or force-cancel,
+- a fee recipient's fees.
 
-Everything else — SELL in ETH, SELL in ERC-20, BUY in ERC-20 — escrows **nothing**.
+They land in `pendingWithdrawals` and are claimed with `withdraw()`. Only the **active caller** —
+the taker collecting proceeds or an excess refund — is paid inline.
 
-## 5. Order validation (permissionless)
+This is not stylistic. If proceeds were pushed, a maker or fee recipient that reverts on receipt
+could make every fill on their order revert, every batch containing it fail, and a compliance
+force-cancel impossible. With pull payments, a hostile recipient inconveniences exactly one person:
+themselves.
 
-A stale order **locks no funds** — it's just a dead row — so validation is book hygiene, not fund
-safety, and is **permissionless** (not an admin power). Safety comes from guarding the *condition*:
+`withdraw()` is never pausable and never gated by compliance. Money already owed is theirs.
 
-- `isOrderFundable(orderId)` → view, anyone: frontends/relayers filter unfundable orders off the book.
-- `cleanupExpiredOrders(orderIds)` → state change, anyone, **expiry-only** (deterministic, ungameable).
-- Underfunding is transient and **not** third-party prunable; only the maker cancels early.
+## 6. Order validation is permissionless
 
-## 6. Security notes
+- **Expiry** is deterministic, so `cleanupExpiredOrders` is open to anyone. There is nothing to
+  farm: escrow goes back to the **maker**, never the caller.
+- **Underfunding** is transient and therefore *not* grounds for a third party to clear an order.
+  Filter with `isOrderFundable` and let the maker cancel.
 
-- **Upgradeability (UUPS) + Timelock is load-bearing.** Users grant the contract an allowance (and
-  BUY+ETH makers escrow ETH in it), so whoever controls the upgrade can in principle change the
-  settlement code and move approved/escrowed balances. `_authorizeUpgrade` is gated by
-  `UPGRADER_ROLE`; that role **MUST** be held by a **Timelock + multisig** so every upgrade is
-  time-delayed and publicly visible, letting users revoke approvals, cancel orders, and exit before
-  it lands. Upgrades must be **append-only** in storage (validated by the OpenZeppelin plugin).
-- **Alternatives to reduce upgrade trust** (future): Permit2 scoped/expiring approvals (no standing
-  allowance to drain), or a split immutable-settlement + upgradeable-config design.
-- **Reentrancy:** every fund-moving entry point is `nonReentrant` (`ReentrancyGuardTransient`,
-  EIP-1153) — `createOrder`, `fillOrder`, `cancelOrder`/`batchCancelOrders`, `adminCancelOrder(s)`,
-  `cleanupExpiredOrders`, and `withdraw` — and all state (order flags, `ethEscrowed`,
-  `pendingWithdrawals`) is written **before** any transfer or `call` (CEI). Pull-payments shrink the
-  ETH-callout surface to a single inline transfer to `msg.sender` at the end of a fill, plus
-  `withdraw`.
-- **Compliance:** when `requireWhitelist` is on, `fillOrder` checks **both** the taker and the
-  order's maker, so a de-whitelisted maker's resting orders stop trading immediately (not just their
-  ability to create new ones).
-- **Open question — ERC-3643/1400 base tokens.** The atomic dual-`transferFrom` assumes a plain
-  `transferFrom(maker → taker)` succeeds. If the base token enforces compliant transfers, both legs
-  must pass compliance in the same tx; validate against the real token or fall back to a DvD manager.
+## 7. Many offerings, one balance
 
-## 7. Contract surface
+v2's addition to this design. One contract now holds every offering a tenant lists, which makes
+"the contract holds nothing" load-bearing in a way it was not when it held one book.
 
-**One contract**, `OTCTrading` (UUPS-upgradeable). There is no periphery and no WETH interface.
+Two properties carry it, and both are invariants in the test suite rather than remarks here:
 
-- **Trading:** `createOrder` (payable), `fillOrder` (payable), `cancelOrder` / `batchCancelOrders`,
-  `cleanupExpiredOrders`, `withdraw` (claim accrued ETH — pull-payment).
-- **Admin:** `adminCancelOrder` / `adminCancelOrders` (ADMIN_ROLE force-cancel; refunds escrow to the
-  maker, distinct `OrderAdminCancelled` event), counterparty-token allowlist (pass `address(0)` to
-  enable ETH), fees, order sizes, expiration, whitelist, fee recipient, pause/unpause.
-- **Upgrade:** `_authorizeUpgrade` (UPGRADER_ROLE).
-- **Views:** `getOrder`, `getUserOrders`, `getRemainingAmount`, `isOrderExpired`, `isOrderFundable`,
-  `ethEscrowed`, and the `ETH` sentinel constant.
+1. **Every wei is spoken for.** `address(this).balance >= totalEthEscrowed + totalPendingWithdrawals`.
+   The rescue path can only take the difference, so it cannot reach a live order's escrow or an
+   unclaimed withdrawal — anyone's, on any offering.
+2. **The venue holds no trading asset.** Both ERC-20 legs move party to party, so a balance here is
+   always stray and never another offering's float.
 
-## 8. Trade-off accepted
+Plus the structural one: an offering's `baseToken` is fixed for its life, so a SELL on offering A
+can only ever move offering A's token.
 
-Allowance-backed orders are **not guaranteed fundable** — a maker can move funds or revoke the
-allowance, so a fill can revert. This is a UX/relayer concern, not a safety one (no funds are lost);
-`isOrderFundable` plus off-chain filtering handles it, as production RFQ/OTC systems (0x, CoW) do.
-BUY+ETH orders are escrowed and therefore always fundable, which is the upside of that trade.
+There is no `receive()` and no `fallback()`. A bare transfer reverts, so ETH cannot enter except
+through a path that accounts for it.
+
+## 8. Contract surface
+
+| Concern | Where |
+| --- | --- |
+| Allowance-backed creation | `createOrder` |
+| Atomic settlement | `fillOrder` → `_priceFill` → `_settle` |
+| Escrow bookkeeping | `ethEscrowed`, `totalEthEscrowed`, `_drawEscrow`, `_refundEscrow` |
+| Pull payments | `pendingWithdrawals`, `totalPendingWithdrawals`, `_creditETH`, `withdraw` |
+| Inline payment to the caller | `_sendETH` |
+| Reserve check | `rescuableAmount` |
+| Fundability | `isOrderFundable` |
+
+## 9. Trade-off accepted
+
+A non-custodial book shows orders that may not be fillable. We consider that strictly better than a
+custodial book where every order is fillable because the contract is holding everyone's money — and
+we say so in the API rather than hiding it: `isOrderFundable` exists precisely because the guarantee
+does not.
